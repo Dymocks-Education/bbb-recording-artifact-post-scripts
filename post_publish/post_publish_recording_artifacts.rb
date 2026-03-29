@@ -49,9 +49,12 @@
 # output directory with an access manifest.
 #
 # If the Phase 1 dump is missing (Postgres was unavailable at archive
-# time), we fall back to events.xml parsing — same data, reconstructed
-# from the event trail. See Phase 1 header for why this is the less
-# preferred path.
+# time), we package the raw files needed for external PDF generation
+# (events.xml, presentation SVGs/PDFs, notes) into the output directory.
+# The events.xml fallback logic lives in a separate standalone script
+# (export_recording_artifacts_eventsxml.rb) that can be run externally
+# in a controlled environment. This keeps the brittle stateful replay
+# code out of the recording pipeline.
 #
 # Dev/prod mode is detected from meeting metadata. This controls output
 # directory, log verbosity, retry/timeout behavior. The intent is that
@@ -65,7 +68,6 @@ require "optimist"
 require "json"
 require "fileutils"
 require "redis"
-require "nokogiri"
 require File.expand_path('../../../lib/recordandplayback', __FILE__)
 
 CONFIG_FILE = "/etc/default/bbb-recording-artifacts"
@@ -179,119 +181,6 @@ def sanitize_filename(name)
 end
 
 # ---------------------------------------------------------------------------
-# Events.xml fallback parser (when Phase 1 dump is missing)
-# ---------------------------------------------------------------------------
-# This is the maintenance-heavy path discussed in the Phase 1 header.
-# It reconstructs presentation metadata, annotations, page dimensions,
-# and user lists from the events.xml event trail and raw archive files.
-#
-# annotations() replays AddTldrawShapeEvent / DeleteTldrawShapeEvent in
-# document order to get final shape state. PITFALL: if BBB changes event
-# ordering or adds new shape mutation events, this breaks silently.
-#
-# page_dimensions() parses SVG viewBox attributes from the raw archive.
-# PITFALL: assumes viewBox="0 0 W H" format. If BBB changes SVG
-# generation (e.g., adds transforms or changes coordinate systems),
-# dimensions will be wrong and annotations will render misaligned.
-
-module EventsXmlFallback
-  def self.meeting_info(events)
-    meeting_el = events.at_xpath("/recording/meeting")
-    breakout_el = events.at_xpath("/recording/breakout")
-    breakout_rooms = events.xpath("/recording/breakoutRooms/breakoutRoom").map { |r| r.content.strip }
-
-    {
-      "meetingId" => meeting_el["id"],
-      "extId" => meeting_el["externalId"],
-      "name" => meeting_el["name"],
-      "isBreakout" => meeting_el["breakout"] == "true",
-      "parentMeetingId" => breakout_el ? breakout_el["parentMeetingId"] : nil,
-      "sequence" => breakout_el ? breakout_el["sequence"] : nil,
-      "breakoutRooms" => breakout_rooms,
-    }
-  end
-
-  def self.participants(events)
-    users = {}
-    events.xpath('/recording/event[@eventname="ParticipantJoinEvent"]').each do |event|
-      uid = event.at_xpath("userId")&.content
-      next unless uid
-      next if users.key?(uid)
-      users[uid] = {
-        "userId" => uid,
-        "extId" => event.at_xpath("externalUserId")&.content,
-        "name" => event.at_xpath("name")&.content,
-      }
-    end
-    users.values
-  end
-
-  def self.presentations(events, raw_dir)
-    presentations = {}
-    events.xpath('/recording/event[@eventname="ConversionCompletedEvent"]').each do |event|
-      pid = event.at_xpath("presentationName")&.content
-      next unless pid
-      presentations[pid] = { "presentationId" => pid, "name" => event.at_xpath("originalFilename")&.content || pid }
-    end
-    if presentations.empty?
-      pres_dir = File.join(raw_dir, "presentation")
-      if File.directory?(pres_dir)
-        Dir.children(pres_dir).each do |pid|
-          next unless File.directory?(File.join(pres_dir, pid))
-          presentations[pid] = { "presentationId" => pid, "name" => pid }
-        end
-      end
-    end
-    presentations
-  end
-
-  def self.annotations(events)
-    annotations = {}
-    events.xpath('/recording/event[@eventname="AddTldrawShapeEvent"]').each do |event|
-      pid = event.at_xpath("presentation")&.content
-      pnum = event.at_xpath("pageNumber")&.content&.to_i
-      sid = event.at_xpath("shapeId")&.content
-      raw = event.at_xpath("shapeData")&.content
-      uid = event.at_xpath("userId")&.content
-      next unless pid && pnum && sid && raw
-      data = JSON.parse(raw) rescue next
-      wb_id = event.at_xpath("whiteboardId")&.content || "#{pid}/#{pnum}"
-      annotations[pid] ||= {}
-      annotations[pid][pnum] ||= {}
-      annotations[pid][pnum][sid] = { "id" => sid, "annotationInfo" => data, "wbId" => wb_id, "userId" => uid }
-    end
-    events.xpath('/recording/event[@eventname="DeleteTldrawShapeEvent"]').each do |event|
-      pid = event.at_xpath("presentation")&.content
-      pnum = event.at_xpath("pageNumber")&.content&.to_i
-      sid = event.at_xpath("shapeId")&.content
-      next unless pid && pnum && sid
-      annotations.dig(pid, pnum)&.delete(sid)
-    end
-    result = {}
-    annotations.each do |pid, pages|
-      result[pid] = {}
-      pages.each { |pnum, shapes| result[pid][pnum] = shapes.values }
-    end
-    result
-  end
-
-  def self.page_dimensions(raw_dir, pres_id)
-    svgs_dir = File.join(raw_dir, "presentation", pres_id, "svgs")
-    pages = {}
-    return pages unless File.directory?(svgs_dir)
-    Dir.glob(File.join(svgs_dir, "slide*.svg")).each do |svg|
-      pnum = File.basename(svg, ".svg").sub("slide", "").to_i
-      next if pnum < 1
-      header = File.read(svg, 1024) rescue next
-      if (m = header.match(/viewBox="0\s+0\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)"/))
-        pages[pnum] = { "width" => m[1].to_f, "height" => m[2].to_f }
-      end
-    end
-    pages
-  end
-end
-
-# ---------------------------------------------------------------------------
 # Exporter
 # ---------------------------------------------------------------------------
 
@@ -342,7 +231,6 @@ class RecordingArtifactsExporter
         next []
       end
 
-      events = Nokogiri::XML(File.open(events_xml_path))
       dump = load_phase1_dump(raw_dir)
 
       exports = []
@@ -350,10 +238,10 @@ class RecordingArtifactsExporter
 
       if dump
         @logger.info("Using Phase 1 Postgres dump for #{@meeting_id} (mode=#{@mode})")
-        export_from_dump(raw_dir, events, dump, exports, errors)
+        export_from_dump(raw_dir, dump, exports, errors)
       else
-        @logger.info("No Phase 1 dump for #{@meeting_id}, falling back to events.xml (mode=#{@mode})")
-        export_from_events_xml(raw_dir, events, exports, errors)
+        @logger.info("No Phase 1 dump for #{@meeting_id}, packaging raw files for external processing (mode=#{@mode})")
+        package_raw_files(raw_dir, exports, errors)
       end
 
       if errors.empty?
@@ -443,26 +331,19 @@ class RecordingArtifactsExporter
   # Export from Phase 1 Postgres dump (preferred path)
   # =========================================================================
 
-  def export_from_dump(raw_dir, events, dump, exports, errors)
+  def export_from_dump(raw_dir, dump, exports, errors)
     meeting_ctx = dump["meeting"]
     mid = meeting_ctx["meetingId"]
 
     # Export parent meeting
-    export_meeting_from_dump(raw_dir, events, dump, meeting_ctx, dump["users"], exports, errors)
+    export_meeting_from_dump(raw_dir, dump, meeting_ctx, dump["users"], exports, errors)
 
     # Export breakout rooms
     if @include_breakouts && !meeting_ctx["isBreakout"]
       (dump["breakouts"] || []).each do |breakout|
         br_mid = breakout["meetingId"]
         br_raw_dir = File.join(@recording_dir, "raw", br_mid)
-        br_events_path = File.join(br_raw_dir, "events.xml")
 
-        unless File.exist?(br_events_path)
-          @logger.info("Breakout #{br_mid} has no events.xml, skipping")
-          next
-        end
-
-        br_events = Nokogiri::XML(File.open(br_events_path))
         br_ctx = {
           "meetingId" => br_mid,
           "isBreakout" => true,
@@ -471,12 +352,12 @@ class RecordingArtifactsExporter
           "name" => breakout["name"],
         }
         br_users = (dump["breakoutUsers"] || {})[br_mid] || []
-        export_meeting_from_dump(br_raw_dir, br_events, nil, br_ctx, br_users, exports, errors)
+        export_meeting_from_dump(br_raw_dir, nil, br_ctx, br_users, exports, errors)
       end
     end
   end
 
-  def export_meeting_from_dump(raw_dir, events, dump, meeting_ctx, authorized_users, exports, errors)
+  def export_meeting_from_dump(raw_dir, dump, meeting_ctx, authorized_users, exports, errors)
     mid = meeting_ctx["meetingId"]
     is_breakout = meeting_ctx["isBreakout"]
 
@@ -500,25 +381,10 @@ class RecordingArtifactsExporter
         @logger.info("No pre-generated PDFs for breakout #{mid}, generating via Redis")
       end
 
-      # Use dump presentations for parent meeting, events.xml for breakouts without dump
-      presentations = if dump
-        dump["presentations"] || []
-      else
-        # Breakout room — build from events.xml
-        evts_pres = EventsXmlFallback.presentations(events, raw_dir)
-        evts_anns = EventsXmlFallback.annotations(events)
-        evts_pres.values.map do |p|
-          pid = p["presentationId"]
-          page_dims = EventsXmlFallback.page_dimensions(raw_dir, pid)
-          page_anns = evts_anns[pid] || {}
-          all_pages = (page_dims.keys + page_anns.keys).uniq.sort
-          pages = all_pages.map do |pnum|
-            dims = page_dims[pnum] || { "width" => 1920.0, "height" => 1080.0 }
-            { "page" => pnum, "width" => dims["width"], "height" => dims["height"],
-              "annotations" => page_anns[pnum] || [] }
-          end
-          p.merge("pages" => pages)
-        end
+      presentations = dump ? (dump["presentations"] || []) : []
+
+      if presentations.empty? && !is_breakout
+        @logger.warn("No presentations in Phase 1 dump for #{mid}")
       end
 
       presentations.each do |pres|
@@ -552,110 +418,105 @@ class RecordingArtifactsExporter
     end
 
     # --- Shared notes ---
-    export_shared_notes(raw_dir, events, meeting_ctx, authorized_users, exports, errors) if @export_notes
+    export_shared_notes(raw_dir, meeting_ctx, authorized_users, exports, errors) if @export_notes
   end
 
   # =========================================================================
-  # Export from events.xml fallback (no Phase 1 dump)
+  # Raw file packaging (no Phase 1 dump — for external processing)
   # =========================================================================
+  # When the Phase 1 Postgres snapshot is missing, we can't generate PDFs
+  # locally. Instead, we package the raw files an external service needs to
+  # run the events.xml fallback script (export_recording_artifacts_eventsxml.rb)
+  # in a controlled environment.
+  #
+  # Packaged files:
+  #   - events.xml                         (event trail for annotation replay)
+  #   - presentation/{presId}/svgs/*.svg   (base slides for PDF rendering)
+  #   - presentation/{presId}/*.pdf        (original uploaded PDFs)
+  #   - presentation/{presId}/pdfs/**      (pre-generated breakout PDFs)
+  #   - notes/notes.*                      (shared notes, already archived)
 
-  def export_from_events_xml(raw_dir, events, exports, errors)
-    meeting_info = EventsXmlFallback.meeting_info(events)
-    participants = EventsXmlFallback.participants(events)
+  def package_raw_files(raw_dir, exports, errors)
+    mid = @meeting_id
+    package_dir = File.join(@output_dir, mid, "raw-package")
+    FileUtils.mkdir_p(package_dir)
 
-    export_meeting_from_events_xml(raw_dir, events, meeting_info, participants, exports, errors)
+    files_copied = 0
 
-    if @include_breakouts && !meeting_info["isBreakout"]
-      meeting_info["breakoutRooms"].each do |br_mid|
-        br_raw_dir = File.join(@recording_dir, "raw", br_mid)
-        br_events_path = File.join(br_raw_dir, "events.xml")
-        unless File.exist?(br_events_path)
-          @logger.info("Breakout #{br_mid} has no events.xml, skipping")
-          next
-        end
-        br_events = Nokogiri::XML(File.open(br_events_path))
-        br_info = EventsXmlFallback.meeting_info(br_events)
-        br_participants = EventsXmlFallback.participants(br_events)
-        export_meeting_from_events_xml(br_raw_dir, br_events, br_info, br_participants, exports, errors)
-      end
-    end
-  end
-
-  def export_meeting_from_events_xml(raw_dir, events, meeting_info, participants, exports, errors)
-    mid = meeting_info["meetingId"]
-    is_breakout = meeting_info["isBreakout"]
-
-    meeting_ctx = {
-      "meetingId" => mid,
-      "isBreakout" => is_breakout,
-      "parentMeetingId" => meeting_info["parentMeetingId"],
-      "sequence" => meeting_info["sequence"],
-      "name" => meeting_info["name"],
-    }
-
-    # --- Annotated slides ---
-    begin
-      if is_breakout
-        existing = find_existing_annotated_pdfs(raw_dir)
-        unless existing.empty?
-          @logger.info("Found #{existing.length} pre-generated PDF(s) for breakout #{mid}")
-          existing.each do |pdf|
-            result = store_artifact("annotated-slides", pdf, meeting_ctx, participants)
-            exports << result if result
-          end
-          raise :skip_slides
-        end
-      end
-
-      annotations_by_pres = EventsXmlFallback.annotations(events)
-      unless annotations_by_pres.empty?
-        presentations = EventsXmlFallback.presentations(events, raw_dir)
-
-        annotations_by_pres.each do |pres_id, pages_anns|
-          pres_info = presentations[pres_id]
-          unless pres_info
-            @logger.warn("Presentation #{pres_id} not found for #{mid}, skipping")
-            next
-          end
-
-          page_dims = EventsXmlFallback.page_dimensions(raw_dir, pres_id)
-          if page_dims.empty?
-            @logger.warn("No SVG slides for #{pres_id} in #{mid}, skipping")
-            next
-          end
-
-          pres_location = resolve_pres_location(raw_dir, mid, pres_id)
-          unless pres_location
-            @logger.warn("No presentation files for #{pres_id} in #{mid}, skipping")
-            next
-          end
-
-          all_pages = (page_dims.keys + pages_anns.keys).uniq.sort
-          pages = all_pages.map do |pnum|
-            dims = page_dims[pnum] || { "width" => 1920.0, "height" => 1080.0 }
-            { "page" => pnum, "width" => dims["width"], "height" => dims["height"],
-              "annotations" => pages_anns[pnum] || [] }
-          end
-
-          annotated = pages.select { |p| !p["annotations"].empty? }
-          next if annotated.empty?
-
-          begin
-            pdf_path = generate_annotated_pdf(mid, pres_id, pres_info["name"], pres_location, pages)
-            result = store_artifact("annotated-slides", pdf_path, meeting_ctx, participants, pres_info["name"])
-            exports << result if result
-          rescue => e
-            @logger.error("Annotated PDF failed for #{pres_id} in #{mid}: #{e.message}")
-            errors << { "meeting_id" => mid, "type" => "annotated-slides", "presId" => pres_id, "error" => e.message }
-          end
-        end
-      end
-    rescue => e
-      raise unless e == :skip_slides
+    # events.xml
+    events_src = File.join(raw_dir, "events.xml")
+    if File.exist?(events_src)
+      FileUtils.cp(events_src, File.join(package_dir, "events.xml"))
+      files_copied += 1
+      @logger.info("Packaged events.xml for #{mid}")
+    else
+      @logger.warn("No events.xml found in #{raw_dir}")
+      errors << { "meeting_id" => mid, "type" => "raw-package", "error" => "events.xml missing" }
     end
 
-    # --- Shared notes ---
-    export_shared_notes(raw_dir, events, meeting_ctx, participants, exports, errors) if @export_notes
+    # artifacts-metadata.json (may exist but be corrupt — copy it anyway for debugging)
+    metadata_src = File.join(raw_dir, "artifacts-metadata.json")
+    if File.exist?(metadata_src)
+      FileUtils.cp(metadata_src, File.join(package_dir, "artifacts-metadata.json"))
+      files_copied += 1
+    end
+
+    # Presentation files (SVGs, original PDFs, pre-generated breakout PDFs)
+    pres_src = File.join(raw_dir, "presentation")
+    if File.directory?(pres_src)
+      pres_dest = File.join(package_dir, "presentation")
+      Dir.children(pres_src).each do |pres_id|
+        pres_path = File.join(pres_src, pres_id)
+        next unless File.directory?(pres_path)
+
+        # SVGs
+        svgs_src = File.join(pres_path, "svgs")
+        if File.directory?(svgs_src)
+          svgs_dest = File.join(pres_dest, pres_id, "svgs")
+          FileUtils.mkdir_p(svgs_dest)
+          Dir.glob(File.join(svgs_src, "*.svg")).each do |svg|
+            FileUtils.cp(svg, svgs_dest)
+            files_copied += 1
+          end
+        end
+
+        # Original PDFs (at presentation root level)
+        Dir.glob(File.join(pres_path, "*.pdf")).each do |pdf|
+          pdf_dest = File.join(pres_dest, pres_id)
+          FileUtils.mkdir_p(pdf_dest)
+          FileUtils.cp(pdf, pdf_dest)
+          files_copied += 1
+        end
+
+        # Pre-generated breakout PDFs
+        pdfs_src = File.join(pres_path, "pdfs")
+        if File.directory?(pdfs_src)
+          pdfs_dest = File.join(pres_dest, pres_id, "pdfs")
+          FileUtils.cp_r(pdfs_src, pdfs_dest)
+          files_copied += 1
+        end
+      end
+    end
+
+    # Shared notes
+    notes_src = File.join(raw_dir, "notes")
+    if File.directory?(notes_src)
+      notes_dest = File.join(package_dir, "notes")
+      FileUtils.mkdir_p(notes_dest)
+      Dir.glob(File.join(notes_src, "notes.*")).each do |f|
+        next unless File.size(f) > 0
+        FileUtils.cp(f, notes_dest)
+        files_copied += 1
+      end
+    end
+
+    if files_copied > 0
+      exports << { "artifact_type" => "raw-package", "meeting_id" => mid, "file" => package_dir }
+      @logger.info("Packaged #{files_copied} raw file(s) for external processing: #{package_dir}")
+    else
+      @logger.warn("No raw files found to package for #{mid}")
+      errors << { "meeting_id" => mid, "type" => "raw-package", "error" => "no files found" }
+    end
   end
 
   # =========================================================================
@@ -790,7 +651,7 @@ class RecordingArtifactsExporter
 
   # --- Shared notes ---
 
-  def export_shared_notes(raw_dir, events, meeting_ctx, authorized_users, exports, errors)
+  def export_shared_notes(raw_dir, meeting_ctx, authorized_users, exports, errors)
     mid = meeting_ctx["meetingId"]
 
     notes_dir = File.join(raw_dir, "notes")
@@ -916,7 +777,28 @@ begin
 
   slides = results.count { |r| r["artifact_type"] == "annotated-slides" }
   notes = results.count { |r| r["artifact_type"] == "shared-notes" }
-  BigBlueButton.logger.info("Phase 2 for [#{meeting_id}] completed: #{slides} slide(s), #{notes} note(s) (mode=#{mode})")
+  packages = results.count { |r| r["artifact_type"] == "raw-package" }
+  BigBlueButton.logger.info("Phase 2 for [#{meeting_id}] completed: #{slides} slide(s), #{notes} note(s), #{packages} package(s) (mode=#{mode})")
+
+  # Copy per-meeting log to output directory so it's included in S3 uploads.
+  # Flush the logger first to ensure all entries are written.
+  logger.close rescue nil
+  meeting_log = File.join(log_dir, "recording-artifacts-#{meeting_id}.log")
+  if File.exist?(meeting_log)
+    output_base = config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || MODE_DEFAULTS[mode]["output_dir"]
+    log_dest = File.join(output_base, meeting_id, "logs")
+    FileUtils.mkdir_p(log_dest)
+    FileUtils.cp(meeting_log, File.join(log_dest, "recording-artifacts.log"))
+  end
+
+  # Also copy post_archive log if it exists (Phase 1 snapshot failures)
+  post_archive_log = File.join(log_dir, "post_archive.log")
+  if File.exist?(post_archive_log)
+    output_base = config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || MODE_DEFAULTS[mode]["output_dir"]
+    log_dest = File.join(output_base, meeting_id, "logs")
+    FileUtils.mkdir_p(log_dest)
+    FileUtils.cp(post_archive_log, File.join(log_dest, "post_archive.log"))
+  end
 rescue => e
   BigBlueButton.logger.warn("Phase 2 for [#{meeting_id}] failed: #{e.message}")
   BigBlueButton.logger.warn(e.backtrace.first(5).join("\n")) if e.backtrace
