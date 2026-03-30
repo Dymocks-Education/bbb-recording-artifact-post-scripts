@@ -38,8 +38,7 @@
 # persists with the raw archive indefinitely.
 #
 # Output: meeting context, presentations with pages + annotations, user
-# lists (for access manifests), breakout room assignments, shared notes
-# metadata (padId, lastRev — content is already in raw/notes/notes.pdf).
+# lists (for access manifests), breakout room assignments.
 #
 # As a fallback, Phase 2 can reconstruct this from events.xml. Unlike
 # Postgres, events.xml is dumped from Redis during the archive step and
@@ -61,7 +60,7 @@
 # overlays them on SVGs and writes the PDF to {presLocation}/pdfs/
 # {jobId}/{serverSideFilename}.pdf. The Postgres schema is in
 # bbb-graphql-server/bbb_schema.sql (pres_presentation, pres_page,
-# pres_annotation, breakoutRoom_user, v_sharedNotes).
+# pres_annotation, breakoutRoom_user).
 #
 # Some additional repos you can reference are: bbb-presentation-video, bbb-export-video and bbb-export-annotations
 # These all handle slides generation in some shape or form.
@@ -333,26 +332,6 @@ begin
     pres["pages"] = pages
   end
 
-  # ---------------------------------------------------------------------------
-  # Shared notes metadata
-  # ---------------------------------------------------------------------------
-  # We only care about the main "notes" pad (sharedNotesExtId = 'notes').
-  # Meetings can have additional pads for closed captions (ext ID contains
-  # "_cc_") — we skip those.
-  #
-  # We don't dump the notes *content* here — the archive phase already
-  # fetched it from Etherpad and stored it as raw/{meetingId}/notes/notes.pdf.
-  # We just capture the padId and lastRev for manifest metadata.
-  shared_notes = pg_json(conn, <<~SQL)
-    SELECT row_to_json(t)::text FROM (
-      SELECT sn."sharedNotesExtId", sn."padId", sn."name", sn."lastRev"
-      FROM "v_sharedNotes" sn
-      WHERE sn."meetingId" = #{esc.call(meeting_id)}
-        AND sn."sharedNotesExtId" = 'notes'
-      LIMIT 1
-    ) t;
-  SQL
-
   conn.close
 
   # ---------------------------------------------------------------------------
@@ -371,7 +350,6 @@ begin
     "users" => users,
     "breakoutUsers" => breakout_users,
     "presentations" => presentations,
-    "sharedNotes" => shared_notes,
   }
 
   tmp = "#{output_file}.tmp"

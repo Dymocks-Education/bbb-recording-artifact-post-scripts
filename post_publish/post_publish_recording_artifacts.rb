@@ -44,13 +44,9 @@
 # When present we copy them directly instead of re-rendering via
 # bbb-export-annotations — this is the fast path for breakouts.
 #
-# Shared notes are already archived as raw/{id}/notes/notes.pdf by the
-# archive phase (fetched from Etherpad). We just copy them to the
-# output directory with an access manifest.
-#
 # If the Phase 1 dump is missing (Postgres was unavailable at archive
 # time), we package the raw files needed for external PDF generation
-# (events.xml, presentation SVGs/PDFs, notes) into the output directory.
+# (events.xml, presentation SVGs/PDFs) into the output directory.
 # The events.xml fallback logic lives in a separate standalone script
 # (export_recording_artifacts_eventsxml.rb) that can be run externally
 # in a controlled environment. This keeps the brittle stateful replay
@@ -71,7 +67,6 @@ require "redis"
 require File.expand_path('../../../lib/recordandplayback', __FILE__)
 
 CONFIG_FILE = "/etc/default/bbb-recording-artifacts"
-DEFAULT_NOTES_FORMAT = "pdf"
 
 # All paths come from bigbluebutton.yml (with /etc/bigbluebutton/recording/
 # recording.yml overrides), same as notes.rb, video.rb, etc. Never hardcode
@@ -142,22 +137,12 @@ end
 #   1. Explicit metadata: artifactExportMode=dev|prod (set via BBB API
 #      create call meta_artifactExportMode=dev). Most reliable, but
 #      requires the integration to set it.
-#   2. Origin server name heuristic: bbb-origin-server-name is set by
-#      integrations like Greenlight (it passes the server's FQDN).
-#      If it contains "dev", "staging", "localhost", or "test" we
-#      assume dev mode. This is why edumaxdev.com auto-detects as dev.
-#   3. Config file: BBB_RECORDING_ARTIFACTS_MODE in /etc/default/
-#      bbb-recording-artifacts. Useful for forcing mode on a server
-#      that doesn't match the hostname heuristic.
-#   4. Default: prod (safe default — prod is stricter).
+#   2. Config file: BBB_RECORDING_ARTIFACTS_MODE in /etc/default/
+#      bbb-recording-artifacts. Useful for forcing mode on a server.
+#   3. Default: prod (safe default — prod is stricter).
 def detect_mode(meeting_metadata, config)
   meta_mode = get_metadata("artifactExportMode", meeting_metadata)
   return meta_mode if meta_mode && %w[dev prod].include?(meta_mode)
-
-  origin = get_metadata("bbb-origin-server-name", meeting_metadata)
-  if origin
-    return "dev" if origin.match?(/dev|staging|localhost|test/i)
-  end
 
   config_mode = config["BBB_RECORDING_ARTIFACTS_MODE"]
   return config_mode if config_mode && %w[dev prod].include?(config_mode)
@@ -198,8 +183,6 @@ class RecordingArtifactsExporter
     @retry_max      = parse_positive_integer(config["BBB_RECORDING_ARTIFACTS_RETRY_MAX"],     mode_defaults["retry_max"])
     @retry_delay    = parse_positive_integer(config["BBB_RECORDING_ARTIFACTS_RETRY_DELAY"],   mode_defaults["retry_delay"])
     @include_breakouts = config["BBB_RECORDING_ARTIFACTS_INCLUDE_BREAKOUTS"] != "false"
-    @export_notes      = config["BBB_RECORDING_ARTIFACTS_EXPORT_NOTES"] != "false"
-    @notes_format      = config["BBB_RECORDING_ARTIFACTS_NOTES_FORMAT"] || DEFAULT_NOTES_FORMAT
     @dry_run           = config["BBB_RECORDING_ARTIFACTS_DRY_RUN"] == "true"
 
     # All paths from bigbluebutton.yml, same as notes.rb / video.rb.
@@ -361,12 +344,6 @@ class RecordingArtifactsExporter
     mid = meeting_ctx["meetingId"]
     is_breakout = meeting_ctx["isBreakout"]
 
-    # --- Annotated slides ---
-    # NOTE: raise :skip_slides is a control-flow hack to break out of
-    # the begin/rescue block after storing pre-generated breakout PDFs.
-    # Ruby doesn't have labeled breaks for begin blocks. The rescue at
-    # the bottom filters for this specific symbol and re-raises anything
-    # else.
     begin
       if is_breakout
         existing = find_existing_annotated_pdfs(raw_dir)
@@ -417,24 +394,19 @@ class RecordingArtifactsExporter
       raise unless e == :skip_slides
     end
 
-    # --- Shared notes ---
-    export_shared_notes(raw_dir, meeting_ctx, authorized_users, exports, errors) if @export_notes
   end
 
   # =========================================================================
   # Raw file packaging (no Phase 1 dump — for external processing)
   # =========================================================================
-  # When the Phase 1 Postgres snapshot is missing, we can't generate PDFs
-  # locally. Instead, we package the raw files an external service needs to
-  # run the events.xml fallback script (export_recording_artifacts_eventsxml.rb)
-  # in a controlled environment.
+  #
+  # Fallback to allow for generation externally using events.xml and other required files.
   #
   # Packaged files:
   #   - events.xml                         (event trail for annotation replay)
   #   - presentation/{presId}/svgs/*.svg   (base slides for PDF rendering)
   #   - presentation/{presId}/*.pdf        (original uploaded PDFs)
   #   - presentation/{presId}/pdfs/**      (pre-generated breakout PDFs)
-  #   - notes/notes.*                      (shared notes, already archived)
 
   def package_raw_files(raw_dir, exports, errors)
     mid = @meeting_id
@@ -495,18 +467,6 @@ class RecordingArtifactsExporter
           FileUtils.cp_r(pdfs_src, pdfs_dest)
           files_copied += 1
         end
-      end
-    end
-
-    # Shared notes
-    notes_src = File.join(raw_dir, "notes")
-    if File.directory?(notes_src)
-      notes_dest = File.join(package_dir, "notes")
-      FileUtils.mkdir_p(notes_dest)
-      Dir.glob(File.join(notes_src, "notes.*")).each do |f|
-        next unless File.size(f) > 0
-        FileUtils.cp(f, notes_dest)
-        files_copied += 1
       end
     end
 
@@ -649,52 +609,12 @@ class RecordingArtifactsExporter
     raise "Timed out waiting for #{path} after #{@wait_timeout}s"
   end
 
-  # --- Shared notes ---
-
-  def export_shared_notes(raw_dir, meeting_ctx, authorized_users, exports, errors)
-    mid = meeting_ctx["meetingId"]
-
-    notes_dir = File.join(raw_dir, "notes")
-    notes_file = File.join(notes_dir, "notes.#{@notes_format}")
-
-    unless File.exist?(notes_file) && File.size(notes_file) > 0
-      fallback = Dir.glob(File.join(notes_dir, "notes.*")).find { |f| File.size(f) > 0 }
-      if fallback
-        @logger.info("Notes #{@notes_format} not found for #{mid}, using #{File.extname(fallback)}")
-        notes_file = fallback
-      end
-    end
-
-    # Try published directory as last resort (published_dir from bigbluebutton.yml)
-    unless File.exist?(notes_file) && File.size(notes_file) > 0
-      published_dir = BBB_PROPS["published_dir"] || File.join(@artifact_root, "published")
-      published = File.join(published_dir, "notes", mid, "notes.#{@notes_format}")
-      if File.exist?(published) && File.size(published) > 0
-        @logger.info("Using published notes for #{mid}")
-        notes_file = published
-      else
-        @logger.info("No notes available for #{mid}, skipping")
-        return
-      end
-    end
-
-    begin
-      result = store_artifact("shared-notes", notes_file, meeting_ctx, authorized_users)
-      exports << result if result
-    rescue => e
-      @logger.error("Shared notes export failed for #{mid}: #{e.message}")
-      errors << { "meeting_id" => mid, "type" => "shared-notes", "error" => e.message }
-    end
-  end
-
   # --- Artifact storage and access manifests ---
 
   # Output layout:
   #   {output_dir}/{parentMeetingId}/annotated-slides/annotated-{name}.pdf
   #   {output_dir}/{parentMeetingId}/annotated-slides/annotated-{name}.pdf.access.json
-  #   {output_dir}/{parentMeetingId}/shared-notes/notes.pdf
   #   {output_dir}/{parentMeetingId}/breakouts/{seq}/annotated-slides/...
-  #   {output_dir}/{parentMeetingId}/breakouts/{seq}/shared-notes/...
   #
   # Everything nests under the parent meeting ID so breakout artifacts
   # are grouped with their parent. The .access.json manifest lists which
@@ -776,9 +696,8 @@ begin
   results = exporter.run
 
   slides = results.count { |r| r["artifact_type"] == "annotated-slides" }
-  notes = results.count { |r| r["artifact_type"] == "shared-notes" }
   packages = results.count { |r| r["artifact_type"] == "raw-package" }
-  BigBlueButton.logger.info("Phase 2 for [#{meeting_id}] completed: #{slides} slide(s), #{notes} note(s), #{packages} package(s) (mode=#{mode})")
+  BigBlueButton.logger.info("Phase 2 for [#{meeting_id}] completed: #{slides} slide(s), #{packages} package(s) (mode=#{mode})")
 
   # Copy per-meeting log to output directory so it's included in S3 uploads.
   # Flush the logger first to ensure all entries are written.
