@@ -46,29 +46,19 @@ AWS_SECRET_ACCESS_KEY=...
 
 ### 3. Install dependencies
 
-These gems are **not** included in a stock BBB install. They must be added to the recording pipeline's Gemfile and installed into its vendor bundle.
-
-**Add to Gemfile** (`/usr/local/bigbluebutton/core/Gemfile`):
-
-```ruby
-gem 'pg', '~> 1.4.0'
-gem 'aws-sdk-s3', '~> 1.218'
-```
-
-**Note:** BBB 3.0 ships Ruby 3.0.2. The `pg` gem version must be pinned to `~> 1.4.0` — versions 1.5+ require Ruby 3.1+. Using `gem 'pg'` without a version constraint will pull a version that fails to install.
-
-**Install the pg system library** (required to build the `pg` gem native extension):
+These gems are **not** included in a stock BBB install. Install the system library and gems into the recording pipeline's vendor bundle:
 
 ```bash
+# System library required to build the pg gem native extension
 sudo apt-get install -y libpq-dev
-```
 
-**Install gems into the vendor bundle**:
-
-```bash
+# Install gems into the BBB vendor bundle
 cd /usr/local/bigbluebutton/core
-sudo bundle install --path vendor/bundle
+sudo gem install --install-dir vendor/bundle/ruby/3.0.0 pg -v '~> 1.4.0'
+sudo gem install --install-dir vendor/bundle/ruby/3.0.0 aws-sdk-s3 -v '~> 1.218'
 ```
+
+**Note:** BBB 3.0 ships Ruby 3.0.2. The `pg` gem must be pinned to `~> 1.4.0` — versions 1.5+ require Ruby 3.1+ and will fail to install.
 
 **Verify**:
 
