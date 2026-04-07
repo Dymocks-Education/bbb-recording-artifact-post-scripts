@@ -21,60 +21,36 @@
 #
 
 #
-# Phase 2: post_publish hook — artifact generation
+# Phase 2: post_publish hook — artifact generation & export
 #
-# Reads the Postgres snapshot from Phase 1 (artifacts-metadata.json in
-# the raw archive) and uses it to generate annotated slide PDFs and
-# access-scoped artifact copies. No Postgres dependency — by the time
-# this hook runs (after process:video/notes), the meeting data is long
-# gone from bbb_graphql.
+# Reads the Postgres snapshot from Phase 1 (artifacts-metadata.json) and
+# generates annotated slide PDFs, access manifests, and rebuild sources.
 #
-# Annotated PDFs are rendered by bbb-export-annotations. We push jobs
-# to its Redis queue ("exportJobs" list + annotation hash keyed by
-# jobId) and poll for the output PDF. The job format and annotation
-# shape contract are the same as the live application uses — derived
-# from StoreExportJobInRedisPresAnnEvent.scala and process.js (see
-# Phase 1 header for the full derivation chain).
+# PDF rendering is delegated to bbb-export-annotations via its Redis queue.
+# The job format matches the live application (StoreExportJobInRedisPresAnnEvent).
 #
-# For breakout rooms, the "Capture Slides" option in the breakout room
-# creation dialog (bigbluebutton-html5 CreateBreakoutRoom component)
-# tells the breakout to render its annotated whiteboard as a PDF and
-# send it back to the parent room when the breakout ends. These
-# pre-generated PDFs are archived at raw/{id}/presentation/*/pdfs/.
-# When present we copy them directly instead of re-rendering via
-# bbb-export-annotations — this is the fast path for breakouts.
+# For breakout rooms with "Capture Slides" enabled, pre-generated PDFs are
+# used directly. Otherwise the breakout's own Phase 1 dump drives Redis
+# generation — identical to parent meeting processing.
 #
-# If the Phase 1 dump is missing (Postgres was unavailable at archive
-# time), we package the raw files needed for external PDF generation
-# (events.xml, presentation SVGs/PDFs) into the output directory.
-# The events.xml fallback logic lives in a separate standalone script
-# (export_recording_artifacts_eventsxml.rb) that can be run externally
-# in a controlled environment. This keeps the brittle stateful replay
-# code out of the recording pipeline.
-#
-# Dev/prod mode is detected from meeting metadata. This controls output
-# directory, log verbosity, retry/timeout behavior. The intent is that
-# the same code runs on dev and prod servers without config changes —
-# mode is inferred from bbb-origin-server-name in events.xml (set by
-# the integration, e.g., Greenlight passes the server hostname) or an
-# explicit artifactExportMode metadata key on the BBB create API call.
+# S3 layout is designed for self-contained rebuilds: each meeting's export
+# includes source SVGs and the annotation dump alongside generated PDFs.
 #
 
 require "optimist"
 require "json"
 require "fileutils"
 require "redis"
+require "aws-sdk-s3"
+require "net/http"
+require "jwt"
+require "java_properties"
 require File.expand_path('../../../lib/recordandplayback', __FILE__)
 
 CONFIG_FILE = "/etc/default/bbb-recording-artifacts"
 
-# All paths come from bigbluebutton.yml (with /etc/bigbluebutton/recording/
-# recording.yml overrides), same as notes.rb, video.rb, etc. Never hardcode
-# /var/bigbluebutton or /var/log/bigbluebutton — deployments can override these.
 BBB_PROPS = BigBlueButton.read_props
 
-# Mode-specific defaults. Output dirs are relative to raw_presentation_src
-# (typically /var/bigbluebutton) so they follow deployment overrides.
 MODE_DEFAULTS = {
   "dev" => {
     "output_dir"    => "#{BBB_PROPS['raw_presentation_src']}/recording-artifacts-dev",
@@ -100,7 +76,6 @@ opts = Optimist::options do
 end
 meeting_id = opts[:meeting_id]
 
-# Per-meeting log
 log_dir = BBB_PROPS["log_dir"]
 begin
   FileUtils.mkdir_p(log_dir)
@@ -133,13 +108,27 @@ def get_metadata(key, meeting_metadata)
   meeting_metadata.key?(key) ? meeting_metadata[key].value : nil
 end
 
-# Mode detection priority:
-#   1. Explicit metadata: artifactExportMode=dev|prod (set via BBB API
-#      create call meta_artifactExportMode=dev). Most reliable, but
-#      requires the integration to set it.
-#   2. Config file: BBB_RECORDING_ARTIFACTS_MODE in /etc/default/
-#      bbb-recording-artifacts. Useful for forcing mode on a server.
-#   3. Default: prod (safe default — prod is stricter).
+METADATA_TO_CONFIG = {
+  "artifactExportMode"              => "BBB_RECORDING_ARTIFACTS_MODE",
+  "artifactExportS3Bucket"          => "BBB_RECORDING_ARTIFACTS_S3_BUCKET",
+  "artifactExportS3Prefix"          => "BBB_RECORDING_ARTIFACTS_S3_PREFIX",
+  "artifactExportS3Region"          => "BBB_RECORDING_ARTIFACTS_S3_REGION",
+  "artifactExportAwsKeyId"          => "AWS_ACCESS_KEY_ID",
+  "artifactExportAwsSecret"         => "AWS_SECRET_ACCESS_KEY",
+  "artifactExportOutputDir"         => "BBB_RECORDING_ARTIFACTS_OUTPUT_DIR",
+  "artifactExportIncludeBreakouts"  => "BBB_RECORDING_ARTIFACTS_INCLUDE_BREAKOUTS",
+  "artifactExportCallbackUrl"       => "BBB_RECORDING_ARTIFACTS_CALLBACK_URL",
+}.freeze
+
+def load_config(meeting_metadata)
+  config = load_env_config
+  METADATA_TO_CONFIG.each do |meta_key, config_key|
+    value = get_metadata(meta_key, meeting_metadata)
+    config[config_key] = value if value && !value.empty?
+  end
+  config
+end
+
 def detect_mode(meeting_metadata, config)
   meta_mode = get_metadata("artifactExportMode", meeting_metadata)
   return meta_mode if meta_mode && %w[dev prod].include?(meta_mode)
@@ -185,10 +174,12 @@ class RecordingArtifactsExporter
     @include_breakouts = config["BBB_RECORDING_ARTIFACTS_INCLUDE_BREAKOUTS"] != "false"
     @dry_run           = config["BBB_RECORDING_ARTIFACTS_DRY_RUN"] == "true"
 
-    # All paths from bigbluebutton.yml, same as notes.rb / video.rb.
-    # raw_presentation_src is the live presentation root (/var/bigbluebutton)
-    # where bbb-web stores uploaded slides at {root}/{mid}/{mid}/{presId}/.
-    # recording_dir is where the recording pipeline stores raw/process/status.
+    @s3_bucket = config["BBB_RECORDING_ARTIFACTS_S3_BUCKET"]
+    @s3_prefix = config["BBB_RECORDING_ARTIFACTS_S3_PREFIX"]
+    @s3_region = config["BBB_RECORDING_ARTIFACTS_S3_REGION"] || "us-east-1"
+    @callback_url = config["BBB_RECORDING_ARTIFACTS_CALLBACK_URL"]
+    @config = config
+
     @artifact_root = BBB_PROPS["raw_presentation_src"]
     @recording_dir = BBB_PROPS["recording_dir"]
     @published_status_dir = File.join(@recording_dir, "status", "published")
@@ -207,21 +198,19 @@ class RecordingArtifactsExporter
       end
 
       raw_dir = File.join(@recording_dir, "raw", @meeting_id)
-      events_xml_path = File.join(raw_dir, "events.xml")
 
-      unless File.exist?(events_xml_path)
+      unless File.exist?(File.join(raw_dir, "events.xml"))
         @logger.info("No events.xml for #{@meeting_id}, skipping")
         next []
       end
 
       dump = load_phase1_dump(raw_dir)
-
       exports = []
       errors = []
 
       if dump
         @logger.info("Using Phase 1 Postgres dump for #{@meeting_id} (mode=#{@mode})")
-        export_from_dump(raw_dir, dump, exports, errors)
+        export(raw_dir, dump, exports, errors)
       else
         @logger.info("No Phase 1 dump for #{@meeting_id}, packaging raw files for external processing (mode=#{@mode})")
         package_raw_files(raw_dir, exports, errors)
@@ -231,9 +220,11 @@ class RecordingArtifactsExporter
         FileUtils.touch(done_file)
         FileUtils.rm_f(fail_file)
         @logger.info("Artifact export complete for #{@meeting_id}: #{exports.length} artifact(s) (mode=#{@mode})")
+        send_callback(exports) if exports.any?
       elsif exports.any?
         write_fail_file(errors)
         @logger.warn("Artifact export partial for #{@meeting_id}: #{exports.length} ok, #{errors.length} failed")
+        send_callback(exports)
       else
         write_fail_file(errors)
         @logger.error("Artifact export failed for #{@meeting_id}: all artifacts failed")
@@ -243,170 +234,260 @@ class RecordingArtifactsExporter
     end
   end
 
+  def s3_configured?
+    @s3_bucket && !@s3_bucket.empty? && @s3_prefix && !@s3_prefix.empty?
+  end
+
+  def upload_directory_to_s3(local_dir, remote_prefix)
+    return [] unless s3_configured?
+
+    uploaded = []
+    Dir.glob(File.join(local_dir, "**", "*")).each do |file_path|
+      next unless File.file?(file_path)
+      relative = file_path.sub("#{local_dir}/", "")
+      remote_key = "#{remote_prefix}/#{relative}"
+      result = upload_to_s3(file_path, remote_key)
+      uploaded << result if result
+    end
+    uploaded
+  end
+
   private
 
-  # --- Retry helper ---
+  # =========================================================================
+  # Export orchestration
+  # =========================================================================
 
-  def with_retries(label)
-    attempts = 0
+  def export(raw_dir, dump, exports, errors)
+    mid = @meeting_id
+
+    # 1. Process parent meeting
+    process_meeting(raw_dir, dump, mid, exports, errors)
+
+    # 2. Process breakout rooms
+    if @include_breakouts
+      process_breakouts(dump, mid, exports, errors)
+    end
+
+    # 3. Build access manifest
     begin
-      attempts += 1
-      yield
+      result = build_access_manifest(dump)
+      exports << result if result
     rescue => e
-      if attempts < @retry_max
-        delay = @retry_delay * (2 ** (attempts - 1))
-        @logger.warn("#{label} failed (attempt #{attempts}/#{@retry_max}): #{e.message}, retrying in #{delay}s")
-        sleep(delay)
-        retry
+      @logger.error("Access manifest failed for #{mid}: #{e.message}")
+      errors << { "meeting_id" => mid, "scope" => "parent", "type" => "access-manifest", "error" => e.message }
+    end
+  end
+
+  # =========================================================================
+  # Unified meeting processor — works for both parent and breakout
+  # =========================================================================
+  #
+  # Generates annotated PDFs for each presentation with annotations,
+  # uploads the dump and source slides to S3 for rebuild capability.
+
+  def process_meeting(raw_dir, dump, s3_subpath, exports, errors)
+    mid = dump["meeting"]["meetingId"]
+    presentations = dump["presentations"] || []
+    scope = s3_subpath == @meeting_id ? "parent" : "breakout:#{mid}"
+
+    if presentations.empty?
+      @logger.warn("No presentations in Phase 1 dump for #{mid}")
+    end
+
+    # Upload artifacts-metadata.json
+    begin
+      result = store_json_artifact(raw_dir, "artifacts-metadata.json", s3_subpath)
+      exports << result if result
+    rescue => e
+      @logger.error("Artifacts metadata failed for #{mid}: #{e.message}")
+      errors << { "meeting_id" => mid, "scope" => scope, "type" => "artifacts-metadata", "error" => e.message }
+    end
+
+    # Generate and store annotated PDFs
+    presentations.each do |pres|
+      pres_id = pres["presentationId"]
+      pages = pres["pages"] || []
+      annotated_pages = pages.select { |p| p["annotations"] && !p["annotations"].empty? }
+
+      if annotated_pages.empty?
+        @logger.debug("No annotations on #{pres_id} in #{mid}, skipping")
+        next
       end
-      raise
+
+      pres_location = resolve_pres_location(raw_dir, mid, pres_id)
+      unless pres_location
+        @logger.warn("No presentation files for #{pres_id} in #{mid}, skipping")
+        next
+      end
+
+      begin
+        pdf_path = find_or_generate_pdf(mid, s3_subpath, pres, pres_location, pages)
+        result = store_pdf_artifact(pdf_path, s3_subpath, pres["name"])
+        exports << result if result
+      rescue => e
+        @logger.error("Annotated PDF failed for #{pres_id} in #{mid}: #{e.message}")
+        @logger.error(e.backtrace.first(3).join("\n")) if e.backtrace
+        errors << { "meeting_id" => mid, "scope" => scope, "type" => "annotated-slides", "presId" => pres_id, "error" => e.message }
+      end
+
+      # Upload source slides for S3-only rebuild (non-fatal)
+      upload_sources(raw_dir, pres_id, s3_subpath)
     end
   end
 
-  # --- Status/lock files ---
-  # post_publish hooks run once per published format (video, notes, etc.).
-  # Multiple formats can publish concurrently, so the lock prevents
-  # duplicate artifact exports. The done file prevents re-export on
-  # subsequent format publishes or manual re-runs.
+  # =========================================================================
+  # Breakout room orchestration
+  # =========================================================================
 
-  def done_file
-    File.join(@published_status_dir, "#{@meeting_id}-recording-artifacts.done")
-  end
+  def process_breakouts(dump, parent_mid, exports, errors)
+    (dump["breakouts"] || []).each do |breakout|
+      br_mid = breakout["meetingId"]
+      br_raw_dir = File.join(@recording_dir, "raw", br_mid)
+      br_s3_subpath = "#{parent_mid}/breakouts/#{br_mid}"
 
-  def fail_file
-    File.join(@published_status_dir, "#{@meeting_id}-recording-artifacts.fail")
-  end
+      unless File.directory?(br_raw_dir)
+        @logger.warn("Breakout raw dir missing for #{br_mid}, skipping")
+        errors << { "meeting_id" => br_mid, "scope" => "breakout:#{br_mid}", "type" => "breakout-export", "error" => "raw dir missing" }
+        next
+      end
 
-  def lock_file
-    File.join(@published_status_dir, "#{@meeting_id}-recording-artifacts.lock")
-  end
+      # Fast path: pre-generated PDFs from captureslides
+      captureslide_pdfs = find_captureslide_pdfs(br_raw_dir)
+      unless captureslide_pdfs.empty?
+        @logger.info("Found #{captureslide_pdfs.length} pre-generated PDF(s) for breakout #{br_mid}")
+        captureslide_pdfs.each do |pdf_path|
+          result = store_pdf_artifact(pdf_path, br_s3_subpath)
+          exports << result if result
+        end
+        next
+      end
 
-  def write_fail_file(errors)
-    File.write(fail_file, JSON.pretty_generate({
-      "meeting_id" => @meeting_id, "mode" => @mode,
-      "timestamp" => Time.now.iso8601, "errors" => errors,
-    }) + "\n")
-  end
+      # Slow path: generate from breakout's own Phase 1 dump
+      br_dump = load_phase1_dump(br_raw_dir)
+      unless br_dump
+        @logger.warn("No Phase 1 dump for breakout #{br_mid}, cannot generate annotations")
+        errors << { "meeting_id" => br_mid, "scope" => "breakout:#{br_mid}", "type" => "breakout-export", "error" => "no Phase 1 dump" }
+        next
+      end
 
-  def with_export_lock
-    File.open(lock_file, File::RDWR | File::CREAT, 0o644) do |f|
-      f.flock(File::LOCK_EX)
-      yield
-    ensure
-      f.flock(File::LOCK_UN) rescue nil
+      @logger.info("No pre-generated PDFs for breakout #{br_mid}, generating via Redis from Phase 1 dump")
+      process_meeting(br_raw_dir, br_dump, br_s3_subpath, exports, errors)
     end
   end
 
-  # --- Phase 1 dump loader ---
+  # =========================================================================
+  # Artifact storage
+  # =========================================================================
 
-  def load_phase1_dump(raw_dir)
-    path = File.join(raw_dir, "artifacts-metadata.json")
-    return nil unless File.exist?(path)
-    dump = JSON.parse(File.read(path))
-    @logger.debug("Loaded Phase 1 dump: version=#{dump['version']}, dumped=#{dump['dumpedAt']}")
-    dump
+  # Store a JSON file (dump or manifest) to output dir and S3.
+  def store_json_artifact(source_dir, filename, s3_subpath)
+    src = File.join(source_dir, filename)
+    unless File.exist?(src)
+      @logger.warn("No #{filename} in #{source_dir}")
+      return nil
+    end
+
+    output_subdir = File.join(@output_dir, s3_subpath)
+    FileUtils.mkdir_p(output_subdir)
+
+    dest = File.join(output_subdir, filename)
+    FileUtils.cp(src, dest)
+    @logger.info("Stored #{filename}: #{dest}")
+
+    remote_file = upload_to_s3(dest, "#{s3_subpath}/#{filename}")
+
+    { "meeting_id" => @meeting_id, "file" => dest, "remote_file" => remote_file }
+  end
+
+  # Store a PDF artifact to output dir and S3.
+  def store_pdf_artifact(source_path, s3_subpath, pres_name = nil)
+    output_subdir = File.join(@output_dir, s3_subpath)
+    FileUtils.mkdir_p(output_subdir)
+
+    basename = if pres_name
+      "#{sanitize_filename("annotated-#{File.basename(pres_name, File.extname(pres_name))}")}.pdf"
+    else
+      File.basename(source_path)
+    end
+
+    output_file = File.join(output_subdir, basename)
+
+    if @dry_run
+      @logger.info("[dry-run] Would copy #{source_path} -> #{output_file}")
+    elsif File.expand_path(source_path) != File.expand_path(output_file)
+      FileUtils.cp(source_path, output_file)
+    end
+    @logger.info("Stored artifact: #{output_file}")
+
+    remote_file = upload_to_s3(output_file, "#{s3_subpath}/#{basename}")
+
+    { "meeting_id" => @meeting_id, "file" => output_file, "remote_file" => remote_file }
+  end
+
+  # Upload source SVGs and original PDF to S3 for rebuild capability.
+  # Non-fatal: failures are logged but don't block the export.
+  def upload_sources(raw_dir, pres_id, s3_subpath)
+    pres_dir = File.join(raw_dir, "presentation", pres_id)
+    return unless File.directory?(pres_dir)
+
+    # SVGs
+    svgs_dir = File.join(pres_dir, "svgs")
+    if File.directory?(svgs_dir)
+      Dir.glob(File.join(svgs_dir, "slide*.svg")).each do |svg|
+        upload_to_s3(svg, "#{s3_subpath}/sources/#{pres_id}/svgs/#{File.basename(svg)}")
+      end
+    end
+
+    # Original PDF
+    Dir.glob(File.join(pres_dir, "*.pdf")).each do |pdf|
+      upload_to_s3(pdf, "#{s3_subpath}/sources/#{pres_id}/#{File.basename(pdf)}")
+    end
   rescue => e
-    @logger.warn("Failed to load Phase 1 dump: #{e.message}")
-    nil
+    @logger.warn("Source upload failed for #{pres_id} (non-fatal): #{e.message}")
   end
 
   # =========================================================================
-  # Export from Phase 1 Postgres dump (preferred path)
+  # Access manifest
   # =========================================================================
 
-  def export_from_dump(raw_dir, dump, exports, errors)
+  def build_access_manifest(dump)
     meeting_ctx = dump["meeting"]
     mid = meeting_ctx["meetingId"]
+    users = dump["users"] || []
+    breakouts = dump["breakouts"] || []
+    breakout_users = dump["breakoutUsers"] || {}
 
-    # Export parent meeting
-    export_meeting_from_dump(raw_dir, dump, meeting_ctx, dump["users"], exports, errors)
-
-    # Export breakout rooms
-    if @include_breakouts && !meeting_ctx["isBreakout"]
-      (dump["breakouts"] || []).each do |breakout|
-        br_mid = breakout["meetingId"]
-        br_raw_dir = File.join(@recording_dir, "raw", br_mid)
-
-        br_ctx = {
-          "meetingId" => br_mid,
-          "isBreakout" => true,
-          "parentMeetingId" => mid,
-          "sequence" => breakout["sequence"],
-          "name" => breakout["name"],
+    manifest = {
+      "version" => 1,
+      "meetingId" => mid,
+      "extId" => meeting_ctx["extId"],
+      "users" => users,
+      "breakouts" => breakouts.map do |br|
+        {
+          "meetingId" => br["meetingId"],
+          "sequence" => br["sequence"],
+          "name" => br["name"],
+          "users" => breakout_users[br["meetingId"]] || [],
         }
-        br_users = (dump["breakoutUsers"] || {})[br_mid] || []
-        export_meeting_from_dump(br_raw_dir, nil, br_ctx, br_users, exports, errors)
-      end
-    end
-  end
+      end,
+    }
 
-  def export_meeting_from_dump(raw_dir, dump, meeting_ctx, authorized_users, exports, errors)
-    mid = meeting_ctx["meetingId"]
-    is_breakout = meeting_ctx["isBreakout"]
+    output_subdir = File.join(@output_dir, mid)
+    FileUtils.mkdir_p(output_subdir)
 
-    begin
-      if is_breakout
-        existing = find_existing_annotated_pdfs(raw_dir)
-        unless existing.empty?
-          @logger.info("Found #{existing.length} pre-generated PDF(s) for breakout #{mid}")
-          existing.each do |pdf_path|
-            result = store_artifact("annotated-slides", pdf_path, meeting_ctx, authorized_users)
-            exports << result if result
-          end
-          raise :skip_slides
-        end
-        @logger.info("No pre-generated PDFs for breakout #{mid}, generating via Redis")
-      end
+    manifest_path = File.join(output_subdir, "access-manifest.json")
+    File.write(manifest_path, JSON.pretty_generate(manifest) + "\n")
+    @logger.info("Stored access manifest: #{manifest_path}")
 
-      presentations = dump ? (dump["presentations"] || []) : []
+    remote_file = upload_to_s3(manifest_path, "#{mid}/access-manifest.json")
 
-      if presentations.empty? && !is_breakout
-        @logger.warn("No presentations in Phase 1 dump for #{mid}")
-      end
-
-      presentations.each do |pres|
-        pres_id = pres["presentationId"]
-        pages = pres["pages"] || []
-        annotated_pages = pages.select { |p| p["annotations"] && !p["annotations"].empty? }
-
-        if annotated_pages.empty?
-          @logger.debug("No annotations on #{pres_id} in #{mid}, skipping")
-          next
-        end
-
-        pres_location = resolve_pres_location(raw_dir, mid, pres_id)
-        unless pres_location
-          @logger.warn("No presentation files for #{pres_id} in #{mid}, skipping")
-          next
-        end
-
-        begin
-          pdf_path = generate_annotated_pdf(mid, pres_id, pres["name"], pres_location, pages)
-          result = store_artifact("annotated-slides", pdf_path, meeting_ctx, authorized_users, pres["name"])
-          exports << result if result
-        rescue => e
-          @logger.error("Annotated PDF failed for #{pres_id} in #{mid}: #{e.message}")
-          @logger.error(e.backtrace.first(3).join("\n")) if e.backtrace
-          errors << { "meeting_id" => mid, "type" => "annotated-slides", "presId" => pres_id, "error" => e.message }
-        end
-      end
-    rescue => e
-      raise unless e == :skip_slides
-    end
-
+    { "meeting_id" => mid, "file" => manifest_path, "remote_file" => remote_file }
   end
 
   # =========================================================================
-  # Raw file packaging (no Phase 1 dump — for external processing)
+  # Raw file packaging (degraded mode — no Phase 1 dump)
   # =========================================================================
-  #
-  # Fallback to allow for generation externally using events.xml and other required files.
-  #
-  # Packaged files:
-  #   - events.xml                         (event trail for annotation replay)
-  #   - presentation/{presId}/svgs/*.svg   (base slides for PDF rendering)
-  #   - presentation/{presId}/*.pdf        (original uploaded PDFs)
-  #   - presentation/{presId}/pdfs/**      (pre-generated breakout PDFs)
 
   def package_raw_files(raw_dir, exports, errors)
     mid = @meeting_id
@@ -415,7 +496,6 @@ class RecordingArtifactsExporter
 
     files_copied = 0
 
-    # events.xml
     events_src = File.join(raw_dir, "events.xml")
     if File.exist?(events_src)
       FileUtils.cp(events_src, File.join(package_dir, "events.xml"))
@@ -423,17 +503,15 @@ class RecordingArtifactsExporter
       @logger.info("Packaged events.xml for #{mid}")
     else
       @logger.warn("No events.xml found in #{raw_dir}")
-      errors << { "meeting_id" => mid, "type" => "raw-package", "error" => "events.xml missing" }
+      errors << { "meeting_id" => mid, "scope" => "parent", "type" => "raw-package", "error" => "events.xml missing" }
     end
 
-    # artifacts-metadata.json (may exist but be corrupt — copy it anyway for debugging)
     metadata_src = File.join(raw_dir, "artifacts-metadata.json")
     if File.exist?(metadata_src)
       FileUtils.cp(metadata_src, File.join(package_dir, "artifacts-metadata.json"))
       files_copied += 1
     end
 
-    # Presentation files (SVGs, original PDFs, pre-generated breakout PDFs)
     pres_src = File.join(raw_dir, "presentation")
     if File.directory?(pres_src)
       pres_dest = File.join(package_dir, "presentation")
@@ -441,7 +519,6 @@ class RecordingArtifactsExporter
         pres_path = File.join(pres_src, pres_id)
         next unless File.directory?(pres_path)
 
-        # SVGs
         svgs_src = File.join(pres_path, "svgs")
         if File.directory?(svgs_src)
           svgs_dest = File.join(pres_dest, pres_id, "svgs")
@@ -452,7 +529,6 @@ class RecordingArtifactsExporter
           end
         end
 
-        # Original PDFs (at presentation root level)
         Dir.glob(File.join(pres_path, "*.pdf")).each do |pdf|
           pdf_dest = File.join(pres_dest, pres_id)
           FileUtils.mkdir_p(pdf_dest)
@@ -460,7 +536,6 @@ class RecordingArtifactsExporter
           files_copied += 1
         end
 
-        # Pre-generated breakout PDFs
         pdfs_src = File.join(pres_path, "pdfs")
         if File.directory?(pdfs_src)
           pdfs_dest = File.join(pres_dest, pres_id, "pdfs")
@@ -471,72 +546,34 @@ class RecordingArtifactsExporter
     end
 
     if files_copied > 0
-      exports << { "artifact_type" => "raw-package", "meeting_id" => mid, "file" => package_dir }
+      remote_files = upload_directory_to_s3(package_dir, "#{mid}/raw-package")
+      exports << { "meeting_id" => mid, "file" => package_dir, "remote_files" => remote_files }
       @logger.info("Packaged #{files_copied} raw file(s) for external processing: #{package_dir}")
+      @logger.info("Uploaded #{remote_files.length} file(s) to S3") if remote_files.any?
     else
       @logger.warn("No raw files found to package for #{mid}")
-      errors << { "meeting_id" => mid, "type" => "raw-package", "error" => "no files found" }
+      errors << { "meeting_id" => mid, "scope" => "parent", "type" => "raw-package", "error" => "no files found" }
     end
   end
 
   # =========================================================================
-  # Shared helpers
+  # PDF generation
   # =========================================================================
 
-  # bbb-export-annotations reads SVGs from {presLocation}/svgs/slide{N}.svg
-  # and the original PDF from {presLocation}/{presId}.pdf.
-  #
-  # Two locations may have these files:
-  #   1. Live dir: /var/bigbluebutton/{mid}/{mid}/{presId}/
-  #      Still exists at post_archive time, may be cleaned up later by
-  #      bbb-web's PresentationCleanupService.
-  #   2. Raw archive: raw/{mid}/presentation/{presId}/
-  #      Permanent copy created by the archive step.
-  #
-  # We prefer the live dir because bbb-export-annotations was designed
-  # to work with it (same paths the live app uses). The raw archive is
-  # the fallback. PITFALL: if the live dir is cleaned up between
-  # post_archive and post_publish, and the raw archive SVGs have a
-  # different layout, PDF rendering could fail.
-  def resolve_pres_location(raw_dir, mid, pres_id)
-    live = File.join(@artifact_root, mid, mid, pres_id)
-    raw = File.join(raw_dir, "presentation", pres_id)
-    if File.directory?(File.join(live, "svgs"))
-      live
-    elsif File.directory?(File.join(raw, "svgs"))
-      raw
+  # Check for an existing artifact from a previous run, or generate a new one.
+  def find_or_generate_pdf(mid, s3_subpath, pres, pres_location, pages)
+    basename = "#{sanitize_filename("annotated-#{File.basename(pres["name"], File.extname(pres["name"]))}")}.pdf"
+    candidate = File.join(@output_dir, s3_subpath, basename)
+
+    if File.exist?(candidate) && pdf_complete?(candidate)
+      @logger.info("Artifact already exists locally: #{candidate}, skipping PDF generation")
+      return candidate
     end
+
+    generate_annotated_pdf(mid, pres["presentationId"], pres["name"], pres_location, pages)
   end
 
-  # Find pre-generated annotated PDFs in a breakout room's raw archive.
-  # These exist when the "Capture Slides" option was enabled in the
-  # breakout room creation dialog (CreateBreakoutRoom component in
-  # bigbluebutton-html5). The breakout renders its annotated whiteboard
-  # as a PDF and sends it to the parent room before closing. The archive
-  # step stores it at raw/{breakoutId}/presentation/{presId}/pdfs/.
-  def find_existing_annotated_pdfs(raw_dir)
-    pres_dir = File.join(raw_dir, "presentation")
-    return [] unless File.directory?(pres_dir)
-    Dir.glob(File.join(pres_dir, "*", "pdfs", "**", "*.pdf")).select do |pdf|
-      File.size(pdf) > 0 && (File.binread(pdf, 5) rescue nil) == "%PDF-"
-    end
-  end
-
-  # --- Annotated PDF via bbb-export-annotations ---
-
-  # Push a job to bbb-export-annotations via Redis. This replicates what
-  # akka-bbb-apps does during a live export request:
-  #   1. Store annotation data as a Redis hash (key = jobId)
-  #   2. Push the export job JSON to the "exportJobs" list
-  # bbb-export-annotations' master.js blPops from the list, collector.js
-  # reads the hash, process.js renders the PDF with GhostScript.
-  #
-  # The two-step pattern (hash then list push) is required because
-  # master.js uses the list pop as the trigger — the hash must already
-  # exist when collector.js reads it.
-  #
-  # Output path: {presLocation}/pdfs/{jobId}/{serverSideFilename}.pdf
-  # (constructed by process.js, see workers/process.js lines ~439-448)
+  # Push a job to bbb-export-annotations via Redis and wait for the output PDF.
   def generate_annotated_pdf(mid, pres_id, pres_name, pres_location, pages)
     job_id = "#{mid}-artifacts-#{Time.now.to_i}"
     base_name = File.basename(pres_name, File.extname(pres_name))
@@ -589,85 +626,221 @@ class RecordingArtifactsExporter
     end
 
     wait_for_pdf(output_path)
+
+    begin
+      redis = Redis.new
+      redis.del(job_id)
+    rescue => e
+      @logger.debug("Redis cleanup for #{job_id} failed (non-fatal): #{e.message}")
+    ensure
+      redis.close rescue nil
+    end
+
     output_path
   end
 
-  # bbb-export-annotations writes the PDF via GhostScript, which writes
-  # incrementally. We check for the %PDF- magic header to confirm the
-  # file is a complete, valid PDF — not a partial write or an error
-  # message that GhostScript sometimes dumps to the output path.
   def wait_for_pdf(path)
     deadline = Time.now + @wait_timeout
     while Time.now < deadline
       if File.exist?(path) && File.size(path) > 0
-        header = File.binread(path, 5)
-        return path if header == "%PDF-"
-        @logger.warn("File #{path} exists but not a valid PDF yet, waiting...")
+        return path if pdf_complete?(path)
+        @logger.debug("File #{path} exists but PDF not yet complete, waiting...")
       end
       sleep(@poll_interval)
     end
     raise "Timed out waiting for #{path} after #{@wait_timeout}s"
   end
 
-  # --- Artifact storage and access manifests ---
+  def pdf_complete?(path)
+    size = File.size(path)
+    return false if size < 32
+    header = File.binread(path, 5)
+    return false unless header == "%PDF-"
+    tail = File.binread(path, [size, 32].min, [size - 32, 0].max)
+    tail.include?("%%EOF")
+  end
 
-  # Output layout:
-  #   {output_dir}/{parentMeetingId}/annotated-slides/annotated-{name}.pdf
-  #   {output_dir}/{parentMeetingId}/annotated-slides/annotated-{name}.pdf.access.json
-  #   {output_dir}/{parentMeetingId}/breakouts/{seq}/annotated-slides/...
-  #
-  # Everything nests under the parent meeting ID so breakout artifacts
-  # are grouped with their parent. The .access.json manifest lists which
-  # users are authorized to view the artifact — scoped to the breakout
-  # room's participants for breakout artifacts.
-  def store_artifact(artifact_type, source_path, meeting_ctx, authorized_users, pres_name = nil)
-    mid = meeting_ctx["meetingId"]
-    parent_mid = meeting_ctx["isBreakout"] ? meeting_ctx["parentMeetingId"] : mid
+  # =========================================================================
+  # Helpers
+  # =========================================================================
 
-    if meeting_ctx["isBreakout"]
-      seq = meeting_ctx["sequence"] || mid
-      artifact_prefix = File.join(parent_mid, "breakouts", seq.to_s, artifact_type)
-    else
-      artifact_prefix = File.join(parent_mid, artifact_type)
+  def resolve_pres_location(raw_dir, mid, pres_id)
+    live = File.join(@artifact_root, mid, mid, pres_id)
+    raw = File.join(raw_dir, "presentation", pres_id)
+    if File.directory?(File.join(live, "svgs"))
+      live
+    elsif File.directory?(File.join(raw, "svgs"))
+      raw
     end
+  end
 
-    output_subdir = File.join(@output_dir, artifact_prefix)
-    FileUtils.mkdir_p(output_subdir)
+  def find_captureslide_pdfs(raw_dir)
+    pres_dir = File.join(raw_dir, "presentation")
+    return [] unless File.directory?(pres_dir)
+    Dir.glob(File.join(pres_dir, "*", "pdfs", "**", "*.pdf")).select { |pdf| pdf_complete?(pdf) }
+  end
 
-    basename = case artifact_type
-    when "annotated-slides"
-      pres_name ? "#{sanitize_filename("annotated-#{File.basename(pres_name, File.extname(pres_name))}")}.pdf" : File.basename(source_path)
-    else
-      File.basename(source_path)
+  def load_phase1_dump(raw_dir)
+    path = File.join(raw_dir, "artifacts-metadata.json")
+    return nil unless File.exist?(path)
+    dump = JSON.parse(File.read(path))
+    @logger.debug("Loaded Phase 1 dump: version=#{dump['version']}, dumped=#{dump['dumpedAt']}")
+    dump
+  rescue => e
+    @logger.warn("Failed to load Phase 1 dump: #{e.message}")
+    nil
+  end
+
+  # --- Retry helper ---
+
+  def with_retries(label)
+    attempts = 0
+    begin
+      attempts += 1
+      yield
+    rescue => e
+      if attempts < @retry_max
+        delay = @retry_delay * (2 ** (attempts - 1))
+        @logger.warn("#{label} failed (attempt #{attempts}/#{@retry_max}): #{e.message}, retrying in #{delay}s")
+        sleep(delay)
+        retry
+      end
+      raise
     end
+  end
 
-    output_file = File.join(output_subdir, basename)
+  # --- S3 ---
+
+  def s3_client
+    @s3_client ||= begin
+      credentials_opts = {}
+      if @config["AWS_ACCESS_KEY_ID"] && @config["AWS_SECRET_ACCESS_KEY"]
+        credentials_opts[:credentials] = Aws::Credentials.new(
+          @config["AWS_ACCESS_KEY_ID"],
+          @config["AWS_SECRET_ACCESS_KEY"]
+        )
+      end
+      Aws::S3::Client.new(region: @s3_region, **credentials_opts)
+    end
+  end
+
+  def upload_to_s3(local_path, remote_key)
+    return nil unless s3_configured?
+
+    full_key = "#{@s3_prefix}/#{remote_key}"
 
     if @dry_run
-      @logger.info("[dry-run] Would copy #{source_path} -> #{output_file}")
-    else
-      FileUtils.cp(source_path, output_file)
+      @logger.info("[dry-run] Would upload #{local_path} -> s3://#{@s3_bucket}/#{full_key}")
+      return "s3://#{@s3_bucket}/#{full_key}"
     end
-    @logger.info("Stored #{artifact_type}: #{output_file}")
 
-    manifest = {
-      "accessScope" => meeting_ctx["isBreakout"] ? "breakout" : "meeting",
-      "artifactType" => artifact_type,
-      "meetingId" => mid,
-      "parentMeetingId" => parent_mid,
-      "breakoutSequence" => meeting_ctx["sequence"],
-      "authorizedUsers" => authorized_users,
-      "mode" => @mode,
-      "exportedAt" => Time.now.iso8601,
-    }
+    local_size = File.size(local_path)
+    begin
+      head = s3_client.head_object(bucket: @s3_bucket, key: full_key)
+      if head.content_length == local_size
+        @logger.info("Already on S3 (size match): s3://#{@s3_bucket}/#{full_key}")
+        return "s3://#{@s3_bucket}/#{full_key}"
+      end
+      @logger.info("S3 object exists but size differs (local=#{local_size}, remote=#{head.content_length}), re-uploading")
+    rescue Aws::S3::Errors::NotFound
+      # Object doesn't exist yet, proceed with upload
+    end
 
-    manifest_path = "#{output_file}.access.json"
-    tmp = "#{manifest_path}.tmp"
-    File.write(tmp, JSON.pretty_generate(manifest) + "\n")
-    File.rename(tmp, manifest_path)
-    @logger.info("Wrote access manifest: #{manifest_path}")
+    with_retries("S3 upload #{File.basename(local_path)}") do
+      File.open(local_path, "rb") do |file|
+        s3_client.put_object(bucket: @s3_bucket, key: full_key, body: file)
+      end
+    end
+    @logger.info("Uploaded #{local_path} -> s3://#{@s3_bucket}/#{full_key}")
+    "s3://#{@s3_bucket}/#{full_key}"
+  end
 
-    { "artifact_type" => artifact_type, "meeting_id" => mid, "file" => output_file, "manifest" => manifest_path }
+  # --- Callback ---
+
+  def send_callback(exports)
+    return unless @callback_url && !@callback_url.empty?
+
+    bbb_web_properties = "/etc/bigbluebutton/bbb-web.properties"
+    unless File.exist?(bbb_web_properties)
+      @logger.warn("Cannot send callback: #{bbb_web_properties} not found")
+      return
+    end
+
+    props = JavaProperties::Properties.new(bbb_web_properties)
+    secret = props[:securitySalt]
+    unless secret
+      @logger.warn("Cannot send callback: securitySalt not found in bbb-web.properties")
+      return
+    end
+
+    artifacts = exports.map do |e|
+      entry = { "meeting_id" => e["meeting_id"], "file" => e["file"] }
+      entry["remote_file"] = e["remote_file"] if e["remote_file"]
+      entry["remote_files"] = e["remote_files"] if e["remote_files"]
+      entry
+    end
+
+    payload = { meeting_id: @meeting_id, artifacts: artifacts }
+    payload_encoded = JWT.encode(payload, secret)
+
+    if @dry_run
+      @logger.info("[dry-run] Would POST callback to #{@callback_url}")
+      return
+    end
+
+    with_retries("Callback POST") do
+      uri = URI.parse(@callback_url)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == "https")
+      http.open_timeout = 10
+      http.read_timeout = 30
+
+      request = Net::HTTP::Post.new(uri.request_uri)
+      request.set_form_data({ signed_parameters: payload_encoded })
+
+      response = http.request(request)
+      code = response.code.to_i
+
+      if code >= 200 && code < 300
+        @logger.info("Callback successful for #{@meeting_id} (code #{code})")
+      elsif code == 410
+        @logger.info("Callback returned 410 (gone) for #{@meeting_id}")
+      else
+        raise "Callback HTTP #{code} #{response.message}"
+      end
+    end
+  rescue => e
+    @logger.warn("Callback failed for #{@meeting_id}: #{e.message}")
+  end
+
+  # --- Status/lock files ---
+
+  def done_file
+    File.join(@published_status_dir, "#{@meeting_id}-recording-artifacts.done")
+  end
+
+  def fail_file
+    File.join(@published_status_dir, "#{@meeting_id}-recording-artifacts.fail")
+  end
+
+  def lock_file
+    File.join(@published_status_dir, "#{@meeting_id}-recording-artifacts.lock")
+  end
+
+  def write_fail_file(errors)
+    File.write(fail_file, JSON.pretty_generate({
+      "meeting_id" => @meeting_id, "mode" => @mode,
+      "timestamp" => Time.now.iso8601, "errors" => errors,
+    }) + "\n")
+  end
+
+  def with_export_lock
+    File.open(lock_file, File::RDWR | File::CREAT, 0o644) do |f|
+      f.flock(File::LOCK_EX)
+      yield
+    ensure
+      f.flock(File::LOCK_UN) rescue nil
+    end
   end
 end
 
@@ -686,8 +859,20 @@ begin
     exit 0
   end
 
+  # Breakout rooms are processed by the parent meeting's export.
+  begin
+    events_doc = Nokogiri::XML(File.open(events_xml))
+    meeting_el = events_doc.at_xpath("/recording/meeting")
+    if meeting_el && meeting_el["breakout"] == "true"
+      BigBlueButton.logger.info("#{meeting_id} is a breakout room, skipping (handled by parent export)")
+      exit 0
+    end
+  rescue => e
+    BigBlueButton.logger.warn("Could not parse events.xml for breakout check: #{e.message}, continuing")
+  end
+
   meeting_metadata = BigBlueButton::Events.get_meeting_metadata(events_xml)
-  config = load_env_config
+  config = load_config(meeting_metadata)
   mode = detect_mode(meeting_metadata, config)
 
   BigBlueButton.logger.info("Detected mode=#{mode} for [#{meeting_id}]")
@@ -695,33 +880,41 @@ begin
   exporter = RecordingArtifactsExporter.new(meeting_id, opts[:format], mode, config, BigBlueButton.logger)
   results = exporter.run
 
-  slides = results.count { |r| r["artifact_type"] == "annotated-slides" }
-  packages = results.count { |r| r["artifact_type"] == "raw-package" }
-  BigBlueButton.logger.info("Phase 2 for [#{meeting_id}] completed: #{slides} slide(s), #{packages} package(s) (mode=#{mode})")
-
-  # Copy per-meeting log to output directory so it's included in S3 uploads.
-  # Flush the logger first to ensure all entries are written.
-  logger.close rescue nil
-  meeting_log = File.join(log_dir, "recording-artifacts-#{meeting_id}.log")
-  if File.exist?(meeting_log)
-    output_base = config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || MODE_DEFAULTS[mode]["output_dir"]
-    log_dest = File.join(output_base, meeting_id, "logs")
-    FileUtils.mkdir_p(log_dest)
-    FileUtils.cp(meeting_log, File.join(log_dest, "recording-artifacts.log"))
-  end
-
-  # Also copy post_archive log if it exists (Phase 1 snapshot failures)
-  post_archive_log = File.join(log_dir, "post_archive.log")
-  if File.exist?(post_archive_log)
-    output_base = config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || MODE_DEFAULTS[mode]["output_dir"]
-    log_dest = File.join(output_base, meeting_id, "logs")
-    FileUtils.mkdir_p(log_dest)
-    FileUtils.cp(post_archive_log, File.join(log_dest, "post_archive.log"))
-  end
+  BigBlueButton.logger.info("Phase 2 for [#{meeting_id}] completed: #{results.length} artifact(s) (mode=#{mode})")
 rescue => e
   BigBlueButton.logger.warn("Phase 2 for [#{meeting_id}] failed: #{e.message}")
   BigBlueButton.logger.warn(e.backtrace.first(5).join("\n")) if e.backtrace
 end
 
 BigBlueButton.logger.info("Phase 2 recording artifacts for [#{meeting_id}] ends")
+
+# Copy logs to output directory and upload to S3.
+begin
+  logger.flush rescue nil
+
+  output_base = config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || MODE_DEFAULTS[mode]["output_dir"]
+  log_dest = File.join(output_base, meeting_id, "logs")
+
+  meeting_log = File.join(log_dir, "recording-artifacts-#{meeting_id}.log")
+  if File.exist?(meeting_log)
+    FileUtils.mkdir_p(log_dest)
+    FileUtils.cp(meeting_log, File.join(log_dest, "recording-artifacts.log"))
+  end
+
+  post_archive_log = File.join(log_dir, "post_archive.log")
+  if File.exist?(post_archive_log)
+    FileUtils.mkdir_p(log_dest)
+    FileUtils.cp(post_archive_log, File.join(log_dest, "post_archive.log"))
+  end
+
+  if defined?(exporter) && exporter&.s3_configured?
+    if File.directory?(log_dest)
+      exporter.upload_directory_to_s3(log_dest, "#{meeting_id}/logs")
+    end
+  end
+rescue => e
+  $stderr.puts("Log copy failed for #{meeting_id}: #{e.message}")
+end
+
+logger.close rescue nil
 exit 0

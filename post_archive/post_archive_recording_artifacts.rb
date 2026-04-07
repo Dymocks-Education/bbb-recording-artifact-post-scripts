@@ -28,29 +28,14 @@
 # During a live meeting this data lives in Postgres (bbb_graphql), but
 # all meeting tables are UNLOGGED and cascade-delete from the "meeting"
 # row ~60 min after the meeting ends (DestroyMeetingInternalMsg in
-# BigBlueButtonActor.scala). By the time the Phase 2 post_publish hook
-# runs — after process:video/notes, potentially hours later — Postgres
-# has already purged everything.
+# BigBlueButtonActor.scala).
 #
-# This hook runs in post_archive (right after archive+sanity, via
-# sanity_worker.rb), well within the Postgres window. It snapshots the
+# This hook snapshots the
 # data Phase 2 needs into raw/{meetingId}/artifacts-metadata.json, which
 # persists with the raw archive indefinitely.
 #
 # Output: meeting context, presentations with pages + annotations, user
 # lists (for access manifests), breakout room assignments.
-#
-# As a fallback, Phase 2 can reconstruct this from events.xml. Unlike
-# Postgres, events.xml is dumped from Redis during the archive step and
-# persists permanently in the raw directory — it has no expiry window.
-# BBB records whiteboard activity as AddTldrawShapeEvent / DeleteTldraw-
-# ShapeEvent (the same events that bbb-presentation-video and
-# bbb-export-video consume for video rendering), so the data is there.
-# But relying on it means ~150 lines of stateful replay logic, SVG
-# viewBox parsing for page dimensions, and XPath queries whose structure
-# changes silently between BBB releases. Postgres queries against the
-# live schema either work or throw a clear error — no silent breakage.
-# The events.xml path exists for resilience, not as the preferred path.
 #
 # The queries and data shapes here were derived by reverse-engineering
 # bbb-export-annotations. The chain is: akka-bbb-apps constructs Redis
@@ -85,15 +70,11 @@ end
 meeting_id = opts[:meeting_id]
 
 # All paths come from bigbluebutton.yml (with /etc/bigbluebutton/recording/
-# recording.yml overrides), same as notes.rb, video.rb, etc. Never hardcode
-# /var/bigbluebutton or /var/log/bigbluebutton — deployments can override these.
+# recording.yml overrides), same as notes.rb, video.rb, etc. 
 props = BigBlueButton.read_props
 recording_dir = props["recording_dir"]
 log_dir = props["log_dir"]
 
-# All post_archive hooks share a single log file. We don't create per-meeting
-# logs here to keep Phase 1 minimal — Phase 2 creates per-meeting logs since
-# it's the one doing the heavy lifting.
 logger = Logger.new("#{log_dir}/post_archive.log", 'weekly')
 logger.level = Logger::INFO
 BigBlueButton.logger = logger
@@ -105,17 +86,6 @@ output_file = File.join(raw_dir, "artifacts-metadata.json")
 
 BigBlueButton.logger.info("Phase 1 artifacts snapshot for [#{meeting_id}] starts")
 
-# Minimal HOCON parser — extracts key="value" pairs from a named block.
-# Only handles the flat postgres { ... } block in application.conf.
-# This is NOT a general-purpose HOCON parser: it doesn't handle includes,
-# substitutions, multi-line strings, or unquoted values. That's fine here
-# because bbb-apps-akka's postgres block uses only simple quoted strings.
-#
-# Example input it handles:
-#   postgres {
-#     serverName = "127.0.0.1"
-#     portNumber = "5432"
-#   }
 def parse_hocon_properties(text, prefix)
   values = {}
   capture = false
@@ -160,8 +130,12 @@ end
 # JSON object via row_to_json or a JSON array via json_agg). This helper
 # executes the query and parses that single cell. Returns nil if no rows
 # or empty result — callers use || [] for array queries.
-def pg_json(conn, sql)
-  result = conn.exec(sql)
+#
+# Uses exec_params with $1/$2/… placeholders instead of string interpolation.
+# This avoids any dependency on escape_literal (whose availability changed
+# between pg gem versions) and is immune to SQL injection by construction.
+def pg_json(conn, sql, params = [])
+  result = conn.exec_params(sql, params)
   return nil if result.ntuples == 0
   raw = result.getvalue(0, 0)
   return nil if raw.nil? || raw.strip.empty?
@@ -173,7 +147,6 @@ begin
   raise "Cannot detect Postgres connection parameters" unless pg_params
 
   conn = PG.connect(pg_params)
-  esc = PG::Connection.method(:escape_literal)
 
   # ---------------------------------------------------------------------------
   # Meeting context
@@ -181,7 +154,7 @@ begin
   # The LEFT JOIN on meeting_breakoutRoomProps distinguishes breakout rooms
   # from parent meetings. parentMeetingId is set for breakouts but has the
   # sentinel value 'bbb-none' for parent meetings — hence the explicit check.
-  meeting_ctx = pg_json(conn, <<~SQL)
+  meeting_ctx = pg_json(conn, <<~SQL, [meeting_id])
     SELECT row_to_json(t)::text FROM (
       SELECT m."meetingId", m."extId",
              mbp."parentMeetingId", mbp."sequence",
@@ -190,16 +163,13 @@ begin
                   THEN true ELSE false END AS "isBreakout"
       FROM "meeting" m
       LEFT JOIN "meeting_breakoutRoomProps" mbp USING ("meetingId")
-      WHERE m."meetingId" = #{esc.call(meeting_id)}
+      WHERE m."meetingId" = $1
       LIMIT 1
     ) t;
   SQL
 
-  # If the meeting row is already gone, Postgres purged early or this is a
-  # ghost recording. Phase 2 will fall back to events.xml — not an error.
   unless meeting_ctx
     BigBlueButton.logger.info("Meeting #{meeting_id} not found in Postgres, skipping snapshot")
-    conn.close
     exit 0
   end
 
@@ -211,14 +181,14 @@ begin
   # parent meeting — breakout rooms don't have nested breakouts.
   breakouts = []
   unless meeting_ctx["isBreakout"]
-    breakouts = pg_json(conn, <<~SQL) || []
+    breakouts = pg_json(conn, <<~SQL, [meeting_id]) || []
       SELECT COALESCE(json_agg(json_build_object(
         'meetingId', br."breakoutRoomMeetingId",
         'sequence', br."sequence",
         'name', br."name"
       ) ORDER BY br."sequence"), '[]'::json)::text
       FROM "v_breakoutRoom_createdLatest" br
-      WHERE br."meetingId" = #{esc.call(meeting_id)};
+      WHERE br."meetingId" = $1;
     SQL
   end
 
@@ -228,11 +198,11 @@ begin
   # extId is the external user ID passed by the integration (e.g., Greenlight,
   # Moodle). This is what downstream systems use to match BBB users to their
   # own user records. userId is BBB's internal ID (w_xxxxx format).
-  users = pg_json(conn, <<~SQL) || []
+  users = pg_json(conn, <<~SQL, [meeting_id]) || []
     SELECT COALESCE(json_agg(json_build_object(
       'userId', u."userId", 'extId', u."extId", 'name', u."name"
     ) ORDER BY u."userId"), '[]'::json)::text
-    FROM "user" u WHERE u."meetingId" = #{esc.call(meeting_id)};
+    FROM "user" u WHERE u."meetingId" = $1;
   SQL
 
   # ---------------------------------------------------------------------------
@@ -249,13 +219,13 @@ begin
   breakout_users = {}
   breakouts.each do |br|
     br_mid = br["meetingId"]
-    br_users = pg_json(conn, <<~SQL) || []
+    br_users = pg_json(conn, <<~SQL, [br_mid]) || []
       SELECT COALESCE(json_agg(json_build_object(
         'userId', u."userId", 'extId', u."extId", 'name', u."name"
       ) ORDER BY u."userId"), '[]'::json)::text
       FROM "breakoutRoom_user" bru
       JOIN "user" u ON u."meetingId" = bru."meetingId" AND u."userId" = bru."userId"
-      WHERE bru."breakoutRoomMeetingId" = #{esc.call(br_mid)};
+      WHERE bru."breakoutRoomMeetingId" = $1;
     SQL
     breakout_users[br_mid] = br_users
   end
@@ -266,7 +236,7 @@ begin
   # We dump ALL presentations, not just the current one, because users may
   # have annotated slides on a previous presentation before switching.
   # Ordered by createdAt DESC so the most recent (likely current) is first.
-  presentations = pg_json(conn, <<~SQL) || []
+  presentations = pg_json(conn, <<~SQL, [meeting_id]) || []
     SELECT COALESCE(json_agg(json_build_object(
       'presentationId', p."presentationId",
       'name', p."name",
@@ -274,7 +244,7 @@ begin
       'totalPages', p."totalPages"
     ) ORDER BY p."createdAt" DESC), '[]'::json)::text
     FROM "pres_presentation" p
-    WHERE p."meetingId" = #{esc.call(meeting_id)};
+    WHERE p."meetingId" = $1;
   SQL
 
   # For each presentation, fetch pages with their annotations inlined.
@@ -303,7 +273,7 @@ begin
   # construction.
   presentations.each do |pres|
     pres_id = pres["presentationId"]
-    pages = pg_json(conn, <<~SQL) || []
+    pages = pg_json(conn, <<~SQL, [pres_id]) || []
       SELECT COALESCE(json_agg(page_row ORDER BY (page_row->>'page')::int), '[]'::json)::text
       FROM (
         SELECT json_build_object(
@@ -325,14 +295,12 @@ begin
             '[]'::json)
         ) AS page_row
         FROM "pres_page" pp
-        WHERE pp."presentationId" = #{esc.call(pres_id)}
+        WHERE pp."presentationId" = $1
           AND pp."uploadCompleted" IS TRUE
       ) s;
     SQL
     pres["pages"] = pages
   end
-
-  conn.close
 
   # ---------------------------------------------------------------------------
   # Assemble and write dump
@@ -363,16 +331,32 @@ begin
     "#{users.length} user(s), #{breakouts.length} breakout(s) -> #{output_file}"
   )
 
-# PITFALL: We rescue ALL exceptions and exit 0 intentionally. A failing
-# post_archive hook must not block the recording pipeline — the recording
-# should still process and publish even if we can't snapshot Postgres.
-# Phase 2 will detect the missing dump and fall back to events.xml.
+  # ---------------------------------------------------------------------------
+  # Verify presentation sources exist in raw archive
+  # ---------------------------------------------------------------------------
+  # Phase 2 needs SVGs and the original PDF to upload rebuild sources to S3.
+  # The archive step copies these to raw/{meetingId}/presentation/{presId}/,
+  # so they should always be present. Log warnings if anything is missing so
+  # Phase 2 issues are diagnosable from the Phase 1 log.
+  pres_dir = File.join(raw_dir, "presentation")
+  presentations.each do |pres|
+    pres_id = pres["presentationId"]
+    svgs_dir = File.join(pres_dir, pres_id, "svgs")
+    unless File.directory?(svgs_dir) && Dir.glob(File.join(svgs_dir, "slide*.svg")).any?
+      BigBlueButton.logger.warn("Missing SVGs in raw archive for #{pres_id} in [#{meeting_id}]")
+    end
+    unless Dir.glob(File.join(pres_dir, pres_id, "*.pdf")).any?
+      BigBlueButton.logger.warn("Missing original PDF in raw archive for #{pres_id} in [#{meeting_id}]")
+    end
+  end
+
 rescue => e
   BigBlueButton.logger.warn("Phase 1 snapshot for [#{meeting_id}] failed: #{e.message}")
   BigBlueButton.logger.warn(e.backtrace.first(5).join("\n")) if e.backtrace
+ensure
+  conn&.close
 end
 
 BigBlueButton.logger.info("Phase 1 artifacts snapshot for [#{meeting_id}] ends")
 
-# Always exit 0 — never block the pipeline. See rescue comment above.
 exit 0
