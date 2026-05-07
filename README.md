@@ -54,8 +54,11 @@ sudo apt-get install -y libpq-dev
 
 # Install gems into the BBB vendor bundle
 cd /usr/local/bigbluebutton/core
-sudo gem install --install-dir vendor/bundle/ruby/3.0.0 pg -v '~> 1.4.0'
-sudo gem install --install-dir vendor/bundle/ruby/3.0.0 aws-sdk-s3 -v '~> 1.218'
+
+sudo bundle add pg --version '~> 1.4.0'
+sudo bundle add aws-sdk-s3 --version '~> 1.218'
+sudo bundle install --path vendor/bundle
+
 ```
 
 **Note:** BBB 3.0 ships Ruby 3.0.2. The `pg` gem must be pinned to `~> 1.4.0` — versions 1.5+ require Ruby 3.1+ and will fail to install.
@@ -63,7 +66,13 @@ sudo gem install --install-dir vendor/bundle/ruby/3.0.0 aws-sdk-s3 -v '~> 1.218'
 **Verify**:
 
 ```bash
-ls /usr/local/bigbluebutton/core/vendor/bundle/ruby/*/gems/ | grep -E 'pg-|aws-sdk-s3'
+  sudo -u bigbluebutton bundle exec ruby -e 'require "pg"; require "aws-sdk-s3"; puts "ok"'
+```
+
+**Restart recording and playback processes**
+```bash
+  systemctl restart bbb-rap-starter
+  systemctl restart bbb-rap-resque-worker
 ```
 
 ### 4. Verify bbb-export-annotations is running
