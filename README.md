@@ -4,16 +4,24 @@ Two-phase post-hook system that exports annotated slide PDFs and access manifest
 
 ## How it works
 
-**Phase 1 (post_archive)** runs immediately after the recording archive step, while Postgres still has meeting data. It snapshots presentations, annotations, users, and breakout room assignments into `artifacts-metadata.json` in the raw archive. This is critical because Postgres purges meeting data ~60 minutes after the meeting ends.
+**Phase 1 (post_archive)** runs after the recording has archived and passed sanity, while Postgres should still have meeting data. It snapshots presentations, annotations, users, and breakout room assignments into `artifacts-metadata.json` in the raw archive. This is critical because Postgres purges meeting data ~60 minutes after the meeting ends.
 
-**Phase 2 (post_publish)** runs after a recording format is published. It reads the Phase 1 dump, generates annotated slide PDFs via bbb-export-annotations, builds access manifests, uploads everything to S3, and sends an optional callback notification. Breakout rooms are processed by the parent meeting's export.
+**Phase 2 (post_publish)** runs after a recording format is published. It reads the Phase 1 dump, generates annotated slide PDFs via bbb-export-annotations, copies final local artifacts under the published presentation recording, uploads everything to S3, and sends an optional callback notification. Breakout rooms are processed by the parent meeting's export.
 
 ```
 Postgres (live, ephemeral)
   --> Phase 1: snapshot to artifacts-metadata.json (durable)
       --> Phase 2: generate PDFs, upload to S3
-          --> S3: annotated PDFs + source slides + dump (self-contained rebuild)
+          --> canonical local artifacts + S3: annotated PDFs + source slides + dump + logs
 ```
+
+Final local artifacts are stored under:
+
+```text
+/var/bigbluebutton/published/presentation/{meetingId}/artifacts/
+```
+
+This keeps local artifacts aligned with BBB's file-backed recording lifecycle. A Web API `deleteRecordings` soft-delete moves the published presentation recording, including `artifacts/`, into `/var/bigbluebutton/deleted/presentation/{meetingId}/`. S3 retention and deletion remain owned by the downstream consumer.
 
 ## Installation
 
@@ -30,7 +38,7 @@ sudo cp post_publish/post_publish_recording_artifacts.rb \
 ### 2. Install config
 
 ```bash
-sudo cp post_publish/bbb-recording-artifacts.conf /etc/default/bbb-recording-artifacts
+sudo cp .env.example /etc/default/bbb-recording-artifacts
 ```
 
 Edit `/etc/default/bbb-recording-artifacts` with your S3 credentials:
@@ -52,13 +60,12 @@ These gems are **not** included in a stock BBB install. Install the system libra
 # System library required to build the pg gem native extension
 sudo apt-get install -y libpq-dev
 
-# Install gems into the BBB vendor bundle
+# Add the gems to the BBB recording bundle
 cd /usr/local/bigbluebutton/core
 
 sudo bundle add pg --version '~> 1.4.0'
 sudo bundle add aws-sdk-s3 --version '~> 1.218'
 sudo bundle install --path vendor/bundle
-
 ```
 
 **Note:** BBB 3.0 ships Ruby 3.0.2. The `pg` gem must be pinned to `~> 1.4.0` — versions 1.5+ require Ruby 3.1+ and will fail to install.
@@ -66,13 +73,14 @@ sudo bundle install --path vendor/bundle
 **Verify**:
 
 ```bash
-  sudo -u bigbluebutton bundle exec ruby -e 'require "pg"; require "aws-sdk-s3"; puts "ok"'
+sudo -u bigbluebutton bundle exec ruby -e 'require "pg"; require "aws-sdk-s3"; puts "ok"'
 ```
 
-**Restart recording and playback processes**
+**Restart recording and playback processes**:
+
 ```bash
-  systemctl restart bbb-rap-starter
-  systemctl restart bbb-rap-resque-worker
+sudo systemctl restart bbb-rap-starter
+sudo systemctl restart bbb-rap-resque-worker
 ```
 
 ### 4. Verify bbb-export-annotations is running
@@ -103,9 +111,11 @@ All settings can be overridden at three levels (each overrides the previous):
 | `BBB_RECORDING_ARTIFACTS_S3_REGION` | `artifactExportS3Region` | `us-east-1` | AWS region |
 | `AWS_ACCESS_KEY_ID` | `artifactExportAwsKeyId` | _(none)_ | AWS credentials |
 | `AWS_SECRET_ACCESS_KEY` | `artifactExportAwsSecret` | _(none)_ | AWS credentials |
-| `BBB_RECORDING_ARTIFACTS_OUTPUT_DIR` | `artifactExportOutputDir` | mode-dependent | Local output dir |
+| `BBB_RECORDING_ARTIFACTS_OUTPUT_DIR` | `artifactExportOutputDir` | mode-dependent | Temporary staging dir |
 | `BBB_RECORDING_ARTIFACTS_INCLUDE_BREAKOUTS` | `artifactExportIncludeBreakouts` | `true` | Process breakout rooms |
 | `BBB_RECORDING_ARTIFACTS_CALLBACK_URL` | `artifactExportCallbackUrl` | _(none)_ | JWT-signed POST on completion |
+| `BBB_RECORDING_ARTIFACTS_EXPORT_NOTES` | `artifactExportNotes` | `false` | Export archived shared notes |
+| `BBB_RECORDING_ARTIFACTS_NOTES_FORMATS` | `artifactExportNotesFormats` | `pdf` | Comma-separated notes formats |
 | `BBB_RECORDING_ARTIFACTS_WAIT_TIMEOUT` | | `180` (prod) | Seconds to wait for PDF |
 | `BBB_RECORDING_ARTIFACTS_POLL_INTERVAL` | | `2` (prod) | Seconds between PDF polls |
 | `BBB_RECORDING_ARTIFACTS_RETRY_MAX` | | `3` (prod) | Max retry attempts |
@@ -116,7 +126,7 @@ All settings can be overridden at three levels (each overrides the previous):
 
 | Setting | Dev | Prod |
 |---------|-----|------|
-| Output dir | `recording-artifacts-dev/` | `recording-artifacts/` |
+| Staging dir | `recording-artifacts-dev/` | `recording-artifacts/` |
 | Wait timeout | 120s | 180s |
 | Poll interval | 1s | 2s |
 | Max retries | 1 | 3 |
@@ -131,7 +141,12 @@ Everything nests under the parent meeting ID. Each meeting's export is self-cont
 {prefix}/{parentMeetingId}/
     artifacts-metadata.json            # Phase 1 Postgres dump
     access-manifest.json               # user-to-breakout mapping
+    recording-artifacts.fail           # present only on partial/full failure
     annotated-{presentationName}.pdf   # annotated slides
+    shared-notes/
+        notes.pdf
+        notes.html
+        notes.etherpad
     sources/                           # rebuild sources
         {presId}/
             svgs/slide1.svg ... slideN.svg
@@ -147,7 +162,32 @@ Everything nests under the parent meeting ID. Each meeting's export is self-cont
     logs/
         recording-artifacts.log
         post_archive.log
+        post_publish.log
 ```
+
+S3 objects are not deleted by the BBB hook. Downstream systems should apply lifecycle rules or scheduled cleanup to `{prefix}/{parentMeetingId}/`.
+
+## Shared notes
+
+BBB archives shared notes during the archive step when notes were used and the text export is non-empty. The formats available to this exporter are the formats configured in `notes_formats` in `bigbluebutton.yml`. BBB commonly archives:
+
+```yaml
+notes_formats:
+  - etherpad
+  - html
+  - pdf
+```
+
+`txt`, `doc`, and `odt` may also be available if the BBB deployment archives them.
+
+Enable notes export with:
+
+```bash
+BBB_RECORDING_ARTIFACTS_EXPORT_NOTES=true
+BBB_RECORDING_ARTIFACTS_NOTES_FORMATS=pdf,html,etherpad
+```
+
+The exporter copies only matching non-empty `notes.{format}` files that already exist in the raw archive or published notes output. Missing configured formats are logged and skipped; they do not mark the artifact export as failed.
 
 ## Breakout room handling
 
@@ -170,6 +210,8 @@ The S3 export contains everything needed to regenerate annotated PDFs:
 To rebuild, download these files and either:
 - Push a Redis job to bbb-export-annotations (same as Phase 2 does)
 - Use the standalone `export_recording_artifacts_eventsxml.rb` tool to reconstruct the dump from `events.xml` if the original dump is unavailable
+
+If Phase 1 fails, it writes `artifacts-metadata.fail` in the raw archive. When Phase 2 falls back to raw-package mode, that marker is included in `{meetingId}/raw-package/artifacts-metadata.fail` on S3.
 
 ## Callback notification
 
@@ -198,7 +240,9 @@ Signed with `securitySalt` from `/etc/bigbluebutton/bbb-web.properties`.
 
 - Phase 1: `/var/log/bigbluebutton/post_archive.log`
 - Phase 2 (per meeting): `/var/log/bigbluebutton/recording-artifacts-{meetingId}.log`
-- Logs are also copied to the output directory and uploaded to S3 under `{meetingId}/logs/`
+- Logs are also copied to `/var/bigbluebutton/published/presentation/{meetingId}/artifacts/logs/` and uploaded to S3 under `{meetingId}/logs/`
+
+On partial or full artifact failure, `recording-artifacts.fail` is written locally under `artifacts/` and uploaded to S3 at `{meetingId}/recording-artifacts.fail`.
 
 ## Concurrency and idempotency
 
@@ -220,6 +264,14 @@ Signed with `securitySalt` from `/etc/bigbluebutton/bbb-web.properties`.
 
 **Breakout annotations missing**: Verify the breakout's raw archive exists at `/var/bigbluebutton/recording/raw/{breakoutId}/` and contains `artifacts-metadata.json`. If the breakout's post_archive failed, annotations cannot be generated.
 
+**Shared notes missing**: Verify the meeting actually used shared notes and that the requested formats exist in `/var/bigbluebutton/recording/raw/{meetingId}/notes/`. The exporter does not call Etherpad during post_publish; it only copies archived or published notes files.
+
+## Retention and cleanup
+
+Local artifacts are placed under the published presentation recording so BBB's normal file-backed soft-delete moves them with the recording. BBB's daily cleanup in this repository does not appear to purge `/var/bigbluebutton/deleted/` by age; operators who need local hard retention should configure a separate cron outside these hooks.
+
+S3 cleanup is intentionally out of scope for BBB. The downstream consumer should own junior/senior retention, lifecycle rules, and deletion for each `{prefix}/{meetingId}/` tree.
+
 ## Files
 
 | File | Purpose |
@@ -227,4 +279,4 @@ Signed with `securitySalt` from `/etc/bigbluebutton/bbb-web.properties`.
 | `post_archive/post_archive_recording_artifacts.rb` | Phase 1: Postgres snapshot |
 | `post_publish/post_publish_recording_artifacts.rb` | Phase 2: PDF generation, S3 export |
 | `post_publish/export_recording_artifacts_eventsxml.rb` | Standalone: reconstruct dump from events.xml |
-| `post_publish/bbb-recording-artifacts.conf` | Config template (install to `/etc/default/`) |
+| `.env.example` | Config template (install to `/etc/default/bbb-recording-artifacts`) |

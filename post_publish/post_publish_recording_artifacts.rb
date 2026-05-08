@@ -45,6 +45,7 @@ require "aws-sdk-s3"
 require "net/http"
 require "jwt"
 require "java_properties"
+require "time"
 require File.expand_path('../../../lib/recordandplayback', __FILE__)
 
 CONFIG_FILE = "/etc/default/bbb-recording-artifacts"
@@ -97,8 +98,12 @@ def load_env_config
     File.readlines(CONFIG_FILE).each do |line|
       line = line.strip
       next if line.empty? || line.start_with?("#")
+      line = line.sub(/\Aexport\s+/, "")
       key, value = line.split("=", 2)
-      config[key.strip] = value.strip if key && value
+      next unless key && value
+      value = value.strip
+      value = value[1..-2] if value.length >= 2 && value[0] == value[-1] && %w[" '].include?(value[0])
+      config[key.strip] = value
     end
   end
   config
@@ -118,6 +123,9 @@ METADATA_TO_CONFIG = {
   "artifactExportOutputDir"         => "BBB_RECORDING_ARTIFACTS_OUTPUT_DIR",
   "artifactExportIncludeBreakouts"  => "BBB_RECORDING_ARTIFACTS_INCLUDE_BREAKOUTS",
   "artifactExportCallbackUrl"       => "BBB_RECORDING_ARTIFACTS_CALLBACK_URL",
+  "artifactExportNotes"             => "BBB_RECORDING_ARTIFACTS_EXPORT_NOTES",
+  "artifactExportNotesFormats"      => "BBB_RECORDING_ARTIFACTS_NOTES_FORMATS",
+  "artifactExportNotesFormat"       => "BBB_RECORDING_ARTIFACTS_NOTES_FORMAT",
 }.freeze
 
 def load_config(meeting_metadata)
@@ -154,6 +162,12 @@ def sanitize_filename(name)
   value.empty? ? "artifact" : value
 end
 
+def parse_list(value, default)
+  return default unless value && !value.empty?
+  values = value.split(",").map { |item| item.strip.downcase }.reject(&:empty?)
+  values.empty? ? default : values.uniq
+end
+
 # ---------------------------------------------------------------------------
 # Exporter
 # ---------------------------------------------------------------------------
@@ -166,25 +180,40 @@ class RecordingArtifactsExporter
     @logger = logger
 
     mode_defaults = MODE_DEFAULTS[@mode]
-    @output_dir     = config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"]     || mode_defaults["output_dir"]
     @wait_timeout   = parse_positive_integer(config["BBB_RECORDING_ARTIFACTS_WAIT_TIMEOUT"],  mode_defaults["wait_timeout"])
     @poll_interval  = parse_positive_integer(config["BBB_RECORDING_ARTIFACTS_POLL_INTERVAL"], mode_defaults["poll_interval"])
     @retry_max      = parse_positive_integer(config["BBB_RECORDING_ARTIFACTS_RETRY_MAX"],     mode_defaults["retry_max"])
     @retry_delay    = parse_positive_integer(config["BBB_RECORDING_ARTIFACTS_RETRY_DELAY"],   mode_defaults["retry_delay"])
     @include_breakouts = config["BBB_RECORDING_ARTIFACTS_INCLUDE_BREAKOUTS"] != "false"
     @dry_run           = config["BBB_RECORDING_ARTIFACTS_DRY_RUN"] == "true"
+    @export_notes      = config["BBB_RECORDING_ARTIFACTS_EXPORT_NOTES"] == "true"
+    @notes_formats     = parse_list(
+      config["BBB_RECORDING_ARTIFACTS_NOTES_FORMATS"] || config["BBB_RECORDING_ARTIFACTS_NOTES_FORMAT"],
+      ["pdf"]
+    )
 
     @s3_bucket = config["BBB_RECORDING_ARTIFACTS_S3_BUCKET"]
-    @s3_prefix = config["BBB_RECORDING_ARTIFACTS_S3_PREFIX"]
+    @s3_prefix = normalize_s3_prefix(config["BBB_RECORDING_ARTIFACTS_S3_PREFIX"])
     @s3_region = config["BBB_RECORDING_ARTIFACTS_S3_REGION"] || "us-east-1"
     @callback_url = config["BBB_RECORDING_ARTIFACTS_CALLBACK_URL"]
     @config = config
 
     @artifact_root = BBB_PROPS["raw_presentation_src"]
     @recording_dir = BBB_PROPS["recording_dir"]
+    @published_dir = BBB_PROPS["published_dir"]
+    @artifact_dir = File.join(@published_dir, "presentation", @meeting_id, "artifacts")
+    @stage_root = File.join(
+      config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || mode_defaults["output_dir"],
+      @meeting_id,
+      ".stage"
+    )
     @published_status_dir = File.join(@recording_dir, "status", "published")
+    @redis_host = BBB_PROPS["redis_host"] || "127.0.0.1"
+    @redis_port = BBB_PROPS["redis_port"] || 6379
+    @redis_password = BBB_PROPS["redis_password"]
 
-    FileUtils.mkdir_p(@output_dir)
+    FileUtils.mkdir_p(@artifact_dir)
+    FileUtils.mkdir_p(@stage_root)
     FileUtils.mkdir_p(@published_status_dir)
 
     @logger.level = mode_defaults["log_level"]
@@ -219,6 +248,7 @@ class RecordingArtifactsExporter
       if errors.empty?
         FileUtils.touch(done_file)
         FileUtils.rm_f(fail_file)
+        FileUtils.rm_f(local_artifact_path("recording-artifacts.fail"))
         @logger.info("Artifact export complete for #{@meeting_id}: #{exports.length} artifact(s) (mode=#{@mode})")
         send_callback(exports) if exports.any?
       elsif exports.any?
@@ -252,6 +282,32 @@ class RecordingArtifactsExporter
     uploaded
   end
 
+  def copy_and_upload_logs(log_dir, logger)
+    logger.flush rescue nil
+
+    log_dest = local_artifact_path("logs")
+    FileUtils.mkdir_p(log_dest)
+
+    {
+      "recording-artifacts.log" => File.join(log_dir, "recording-artifacts-#{@meeting_id}.log"),
+      "post_archive.log" => File.join(log_dir, "post_archive.log"),
+      "post_publish.log" => File.join(log_dir, "post_publish.log"),
+    }.each do |dest_name, source_path|
+      next unless File.exist?(source_path)
+      FileUtils.cp(source_path, File.join(log_dest, dest_name))
+    end
+
+    upload_directory_to_s3(log_dest, "#{@meeting_id}/logs") if File.directory?(log_dest)
+  rescue => e
+    @logger.warn("Log upload failed for #{@meeting_id}: #{e.message}")
+  end
+
+  def cleanup_stage
+    FileUtils.rm_rf(@stage_root) if File.directory?(@stage_root)
+  rescue => e
+    @logger.warn("Stage cleanup failed for #{@meeting_id}: #{e.message}")
+  end
+
   private
 
   # =========================================================================
@@ -268,6 +324,8 @@ class RecordingArtifactsExporter
     if @include_breakouts
       process_breakouts(dump, mid, exports, errors)
     end
+
+    export_shared_notes(raw_dir, mid, exports, errors) if @export_notes
 
     # 3. Build access manifest
     begin
@@ -304,6 +362,8 @@ class RecordingArtifactsExporter
       errors << { "meeting_id" => mid, "scope" => scope, "type" => "artifacts-metadata", "error" => e.message }
     end
 
+    upload_all_sources(raw_dir, s3_subpath)
+
     # Generate and store annotated PDFs
     presentations.each do |pres|
       pres_id = pres["presentationId"]
@@ -330,9 +390,6 @@ class RecordingArtifactsExporter
         @logger.error(e.backtrace.first(3).join("\n")) if e.backtrace
         errors << { "meeting_id" => mid, "scope" => scope, "type" => "annotated-slides", "presId" => pres_id, "error" => e.message }
       end
-
-      # Upload source slides for S3-only rebuild (non-fatal)
-      upload_sources(raw_dir, pres_id, s3_subpath)
     end
   end
 
@@ -356,6 +413,13 @@ class RecordingArtifactsExporter
       captureslide_pdfs = find_captureslide_pdfs(br_raw_dir)
       unless captureslide_pdfs.empty?
         @logger.info("Found #{captureslide_pdfs.length} pre-generated PDF(s) for breakout #{br_mid}")
+        begin
+          result = store_json_artifact(br_raw_dir, "artifacts-metadata.json", br_s3_subpath)
+          exports << result if result
+        rescue => e
+          @logger.warn("Breakout metadata upload failed for #{br_mid}: #{e.message}")
+        end
+        upload_all_sources(br_raw_dir, br_s3_subpath)
         captureslide_pdfs.each do |pdf_path|
           result = store_pdf_artifact(pdf_path, br_s3_subpath)
           exports << result if result
@@ -388,7 +452,7 @@ class RecordingArtifactsExporter
       return nil
     end
 
-    output_subdir = File.join(@output_dir, s3_subpath)
+    output_subdir = local_artifact_path(local_subpath_for_s3_subpath(s3_subpath))
     FileUtils.mkdir_p(output_subdir)
 
     dest = File.join(output_subdir, filename)
@@ -402,7 +466,7 @@ class RecordingArtifactsExporter
 
   # Store a PDF artifact to output dir and S3.
   def store_pdf_artifact(source_path, s3_subpath, pres_name = nil)
-    output_subdir = File.join(@output_dir, s3_subpath)
+    output_subdir = local_artifact_path(local_subpath_for_s3_subpath(s3_subpath))
     FileUtils.mkdir_p(output_subdir)
 
     basename = if pres_name
@@ -420,9 +484,23 @@ class RecordingArtifactsExporter
     end
     @logger.info("Stored artifact: #{output_file}")
 
-    remote_file = upload_to_s3(output_file, "#{s3_subpath}/#{basename}")
+    remote_file = upload_to_s3(@dry_run ? source_path : output_file, "#{s3_subpath}/#{basename}")
 
     { "meeting_id" => @meeting_id, "file" => output_file, "remote_file" => remote_file }
+  end
+
+  def store_notes_artifact(source_path, format, s3_subpath)
+    output_subdir = local_artifact_path(File.join(local_subpath_for_s3_subpath(s3_subpath), "shared-notes"))
+    FileUtils.mkdir_p(output_subdir)
+
+    basename = "notes.#{format}"
+    output_file = File.join(output_subdir, basename)
+    FileUtils.cp(source_path, output_file) unless @dry_run
+    @logger.info("Stored shared notes artifact: #{output_file}")
+
+    remote_file = upload_to_s3(@dry_run ? source_path : output_file, "#{s3_subpath}/shared-notes/#{basename}")
+
+    { "meeting_id" => @meeting_id, "file" => output_file, "remote_file" => remote_file, "type" => "shared-notes", "format" => format }
   end
 
   # Upload source SVGs and original PDF to S3 for rebuild capability.
@@ -431,20 +509,36 @@ class RecordingArtifactsExporter
     pres_dir = File.join(raw_dir, "presentation", pres_id)
     return unless File.directory?(pres_dir)
 
+    local_sources_dir = local_artifact_path(File.join(local_subpath_for_s3_subpath(s3_subpath), "sources", pres_id))
+
     # SVGs
     svgs_dir = File.join(pres_dir, "svgs")
     if File.directory?(svgs_dir)
+      local_svgs_dir = File.join(local_sources_dir, "svgs")
+      FileUtils.mkdir_p(local_svgs_dir)
       Dir.glob(File.join(svgs_dir, "slide*.svg")).each do |svg|
+        FileUtils.cp(svg, File.join(local_svgs_dir, File.basename(svg))) unless @dry_run
         upload_to_s3(svg, "#{s3_subpath}/sources/#{pres_id}/svgs/#{File.basename(svg)}")
       end
     end
 
     # Original PDF
+    FileUtils.mkdir_p(local_sources_dir)
     Dir.glob(File.join(pres_dir, "*.pdf")).each do |pdf|
+      FileUtils.cp(pdf, File.join(local_sources_dir, File.basename(pdf))) unless @dry_run
       upload_to_s3(pdf, "#{s3_subpath}/sources/#{pres_id}/#{File.basename(pdf)}")
     end
   rescue => e
     @logger.warn("Source upload failed for #{pres_id} (non-fatal): #{e.message}")
+  end
+
+  def upload_all_sources(raw_dir, s3_subpath)
+    pres_root = File.join(raw_dir, "presentation")
+    return unless File.directory?(pres_root)
+
+    Dir.children(pres_root).sort.each do |pres_id|
+      upload_sources(raw_dir, pres_id, s3_subpath)
+    end
   end
 
   # =========================================================================
@@ -473,7 +567,7 @@ class RecordingArtifactsExporter
       end,
     }
 
-    output_subdir = File.join(@output_dir, mid)
+    output_subdir = local_artifact_path(local_subpath_for_s3_subpath(mid))
     FileUtils.mkdir_p(output_subdir)
 
     manifest_path = File.join(output_subdir, "access-manifest.json")
@@ -491,7 +585,7 @@ class RecordingArtifactsExporter
 
   def package_raw_files(raw_dir, exports, errors)
     mid = @meeting_id
-    package_dir = File.join(@output_dir, mid, "raw-package")
+    package_dir = local_artifact_path("raw-package")
     FileUtils.mkdir_p(package_dir)
 
     files_copied = 0
@@ -509,6 +603,12 @@ class RecordingArtifactsExporter
     metadata_src = File.join(raw_dir, "artifacts-metadata.json")
     if File.exist?(metadata_src)
       FileUtils.cp(metadata_src, File.join(package_dir, "artifacts-metadata.json"))
+      files_copied += 1
+    end
+
+    metadata_fail_src = File.join(raw_dir, "artifacts-metadata.fail")
+    if File.exist?(metadata_fail_src)
+      FileUtils.cp(metadata_fail_src, File.join(package_dir, "artifacts-metadata.fail"))
       files_copied += 1
     end
 
@@ -545,6 +645,17 @@ class RecordingArtifactsExporter
       end
     end
 
+    notes_src = File.join(raw_dir, "notes")
+    if File.directory?(notes_src)
+      notes_dest = File.join(package_dir, "notes")
+      FileUtils.mkdir_p(notes_dest)
+      Dir.glob(File.join(notes_src, "notes.*")).each do |note|
+        next unless File.file?(note)
+        FileUtils.cp(note, notes_dest)
+        files_copied += 1
+      end
+    end
+
     if files_copied > 0
       remote_files = upload_directory_to_s3(package_dir, "#{mid}/raw-package")
       exports << { "meeting_id" => mid, "file" => package_dir, "remote_files" => remote_files }
@@ -562,15 +673,60 @@ class RecordingArtifactsExporter
 
   # Check for an existing artifact from a previous run, or generate a new one.
   def find_or_generate_pdf(mid, s3_subpath, pres, pres_location, pages)
-    basename = "#{sanitize_filename("annotated-#{File.basename(pres["name"], File.extname(pres["name"]))}")}.pdf"
-    candidate = File.join(@output_dir, s3_subpath, basename)
+    pres_name = pres["name"] || pres["presentationId"]
+    basename = "#{sanitize_filename("annotated-#{File.basename(pres_name, File.extname(pres_name))}")}.pdf"
+    candidate = local_artifact_path(File.join(local_subpath_for_s3_subpath(s3_subpath), basename))
 
     if File.exist?(candidate) && pdf_complete?(candidate)
       @logger.info("Artifact already exists locally: #{candidate}, skipping PDF generation")
       return candidate
     end
 
-    generate_annotated_pdf(mid, pres["presentationId"], pres["name"], pres_location, pages)
+    export_input_dir = prepare_annotation_export_input(mid, pres["presentationId"], pres_name, pres_location)
+    generate_annotated_pdf(mid, pres["presentationId"], pres_name, export_input_dir, pages)
+  end
+
+  # bbb-export-annotations expects presLocation to contain:
+  #   {presId}.pdf
+  #   svgs/slideN.svg
+  # Raw archives often keep the original uploaded PDF filename instead, so stage
+  # a normalized input directory before queueing the Redis job.
+  def prepare_annotation_export_input(mid, pres_id, pres_name, source_dir)
+    expected_pdf = File.join(source_dir, "#{pres_id}.pdf")
+    svgs_dir = File.join(source_dir, "svgs")
+
+    if File.file?(expected_pdf) && File.directory?(svgs_dir)
+      @logger.info("Using annotation export input directly: #{source_dir}")
+      return source_dir
+    end
+
+    pdf_source = find_presentation_pdf(source_dir, pres_id, pres_name)
+    raise "No source PDF found for #{pres_id} in #{source_dir}" unless pdf_source
+    raise "No SVG slides found for #{pres_id} in #{source_dir}" unless File.directory?(svgs_dir)
+
+    stage_dir = File.join(@stage_root, "export-inputs", mid, pres_id)
+    FileUtils.rm_rf(stage_dir)
+    FileUtils.mkdir_p(stage_dir)
+    FileUtils.cp(pdf_source, File.join(stage_dir, "#{pres_id}.pdf"))
+    FileUtils.cp_r(svgs_dir, File.join(stage_dir, "svgs"))
+
+    @logger.info("Prepared annotation export input for #{pres_id}: pdf=#{pdf_source}, svgs=#{svgs_dir}, stage=#{stage_dir}")
+    stage_dir
+  end
+
+  def find_presentation_pdf(source_dir, pres_id, pres_name)
+    candidates = [File.join(source_dir, "#{pres_id}.pdf"), File.join(source_dir, "#{pres_id}.PDF")]
+
+    if pres_name && !pres_name.empty?
+      basename = File.basename(pres_name, File.extname(pres_name))
+      candidates << File.join(source_dir, pres_name)
+      candidates << File.join(source_dir, "#{basename}.pdf")
+      candidates << File.join(source_dir, "#{basename}.PDF")
+    end
+
+    candidates += Dir.glob(File.join(source_dir, "*.pdf"))
+    candidates += Dir.glob(File.join(source_dir, "*.PDF"))
+    candidates.find { |path| File.file?(path) }
   end
 
   # Push a job to bbb-export-annotations via Redis and wait for the output PDF.
@@ -615,7 +771,7 @@ class RecordingArtifactsExporter
     @logger.info("Queuing annotation export job #{job_id} for #{pres_id}")
 
     with_retries("Redis export job") do
-      redis = Redis.new
+      redis = redis_client
       begin
         redis.del(job_id)
         annotations_payload.each { |k, v| redis.hset(job_id, k, v) }
@@ -628,7 +784,7 @@ class RecordingArtifactsExporter
     wait_for_pdf(output_path)
 
     begin
-      redis = Redis.new
+      redis = redis_client
       redis.del(job_id)
     rescue => e
       @logger.debug("Redis cleanup for #{job_id} failed (non-fatal): #{e.message}")
@@ -691,6 +847,33 @@ class RecordingArtifactsExporter
     nil
   end
 
+  def export_shared_notes(raw_dir, s3_subpath, exports, errors)
+    @notes_formats.each do |format|
+      notes_file = find_notes_file(raw_dir, format)
+      unless notes_file
+        @logger.info("No non-empty shared notes file notes.#{format} for #{@meeting_id}, skipping")
+        next
+      end
+
+      begin
+        result = store_notes_artifact(notes_file, format, s3_subpath)
+        exports << result if result
+      rescue => e
+        @logger.error("Shared notes export failed for #{@meeting_id} format=#{format}: #{e.message}")
+        errors << { "meeting_id" => @meeting_id, "scope" => "parent", "type" => "shared-notes", "format" => format, "error" => e.message }
+      end
+    end
+  end
+
+  def find_notes_file(raw_dir, format)
+    candidates = [
+      File.join(raw_dir, "notes", "notes.#{format}"),
+      File.join(@published_dir, "notes", @meeting_id, "notes.#{format}"),
+      File.join(@published_dir, "presentation", @meeting_id, "notes.#{format}"),
+    ]
+    candidates.find { |path| File.file?(path) && File.size(path).positive? }
+  end
+
   # --- Retry helper ---
 
   def with_retries(label)
@@ -707,6 +890,12 @@ class RecordingArtifactsExporter
       end
       raise
     end
+  end
+
+  def redis_client
+    opts = { host: @redis_host, port: @redis_port }
+    opts[:password] = @redis_password if @redis_password && !@redis_password.empty?
+    Redis.new(opts)
   end
 
   # --- S3 ---
@@ -727,7 +916,7 @@ class RecordingArtifactsExporter
   def upload_to_s3(local_path, remote_key)
     return nil unless s3_configured?
 
-    full_key = "#{@s3_prefix}/#{remote_key}"
+    full_key = s3_key(remote_key)
 
     if @dry_run
       @logger.info("[dry-run] Would upload #{local_path} -> s3://#{@s3_bucket}/#{full_key}")
@@ -828,10 +1017,19 @@ class RecordingArtifactsExporter
   end
 
   def write_fail_file(errors)
-    File.write(fail_file, JSON.pretty_generate({
+    payload = {
       "meeting_id" => @meeting_id, "mode" => @mode,
       "timestamp" => Time.now.iso8601, "errors" => errors,
-    }) + "\n")
+    }
+    content = JSON.pretty_generate(payload) + "\n"
+    File.write(fail_file, content)
+
+    artifact_fail = local_artifact_path("recording-artifacts.fail")
+    FileUtils.mkdir_p(File.dirname(artifact_fail))
+    File.write(artifact_fail, content)
+    upload_to_s3(artifact_fail, "#{@meeting_id}/recording-artifacts.fail")
+  rescue => e
+    @logger.warn("Could not write or upload artifact fail file for #{@meeting_id}: #{e.message}")
   end
 
   def with_export_lock
@@ -842,6 +1040,25 @@ class RecordingArtifactsExporter
       f.flock(File::LOCK_UN) rescue nil
     end
   end
+
+  def local_subpath_for_s3_subpath(s3_subpath)
+    return "" if s3_subpath == @meeting_id
+    prefix = "#{@meeting_id}/"
+    s3_subpath.start_with?(prefix) ? s3_subpath.delete_prefix(prefix) : s3_subpath
+  end
+
+  def local_artifact_path(relative_path)
+    relative_path.nil? || relative_path.empty? ? @artifact_dir : File.join(@artifact_dir, relative_path)
+  end
+
+  def normalize_s3_prefix(prefix)
+    return nil unless prefix
+    prefix.strip.gsub(%r{\A/+|/+\z}, "")
+  end
+
+  def s3_key(remote_key)
+    "#{@s3_prefix}/#{remote_key.gsub(%r{\A/+}, "")}"
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -849,6 +1066,10 @@ end
 # ---------------------------------------------------------------------------
 
 BigBlueButton.logger.info("Phase 2 recording artifacts for [#{meeting_id}] starts")
+
+config = load_env_config
+mode = detect_mode({}, config)
+exporter = nil
 
 begin
   recording_dir = BBB_PROPS["recording_dir"]
@@ -890,30 +1111,11 @@ BigBlueButton.logger.info("Phase 2 recording artifacts for [#{meeting_id}] ends"
 
 # Copy logs to output directory and upload to S3.
 begin
-  logger.flush rescue nil
-
-  output_base = config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || MODE_DEFAULTS[mode]["output_dir"]
-  log_dest = File.join(output_base, meeting_id, "logs")
-
-  meeting_log = File.join(log_dir, "recording-artifacts-#{meeting_id}.log")
-  if File.exist?(meeting_log)
-    FileUtils.mkdir_p(log_dest)
-    FileUtils.cp(meeting_log, File.join(log_dest, "recording-artifacts.log"))
-  end
-
-  post_archive_log = File.join(log_dir, "post_archive.log")
-  if File.exist?(post_archive_log)
-    FileUtils.mkdir_p(log_dest)
-    FileUtils.cp(post_archive_log, File.join(log_dest, "post_archive.log"))
-  end
-
-  if defined?(exporter) && exporter&.s3_configured?
-    if File.directory?(log_dest)
-      exporter.upload_directory_to_s3(log_dest, "#{meeting_id}/logs")
-    end
-  end
+  exporter.copy_and_upload_logs(log_dir, logger) if exporter
 rescue => e
   $stderr.puts("Log copy failed for #{meeting_id}: #{e.message}")
+ensure
+  exporter.cleanup_stage if exporter
 end
 
 logger.close rescue nil

@@ -54,6 +54,7 @@ require "optimist"
 require "json"
 require "fileutils"
 require "pg"                # Only Phase 1 needs pg; Phase 2 is Postgres-free
+require "time"
 require File.expand_path('../../../lib/recordandplayback', __FILE__)
 
 # Postgres connection params are in the bbb-apps-akka HOCON config, not a
@@ -83,6 +84,7 @@ BigBlueButton.logger = logger
 # archive step before this hook runs. It persists until explicitly deleted.
 raw_dir = File.join(recording_dir, "raw", meeting_id)
 output_file = File.join(raw_dir, "artifacts-metadata.json")
+fail_file = File.join(raw_dir, "artifacts-metadata.fail")
 
 BigBlueButton.logger.info("Phase 1 artifacts snapshot for [#{meeting_id}] starts")
 
@@ -323,6 +325,7 @@ begin
   tmp = "#{output_file}.tmp"
   File.write(tmp, JSON.pretty_generate(dump) + "\n")
   File.rename(tmp, output_file)
+  FileUtils.rm_f(fail_file)
 
   total_annotations = presentations.sum { |p| (p["pages"] || []).sum { |pg| (pg["annotations"] || []).length } }
   BigBlueButton.logger.info(
@@ -353,6 +356,16 @@ begin
 rescue => e
   BigBlueButton.logger.warn("Phase 1 snapshot for [#{meeting_id}] failed: #{e.message}")
   BigBlueButton.logger.warn(e.backtrace.first(5).join("\n")) if e.backtrace
+  begin
+    FileUtils.mkdir_p(raw_dir)
+    File.write(fail_file, JSON.pretty_generate({
+      "meeting_id" => meeting_id,
+      "timestamp" => Time.now.iso8601,
+      "error" => e.message,
+    }) + "\n")
+  rescue => marker_error
+    BigBlueButton.logger.warn("Could not write #{fail_file}: #{marker_error.message}")
+  end
 ensure
   conn&.close
 end
