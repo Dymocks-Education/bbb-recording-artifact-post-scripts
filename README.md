@@ -140,7 +140,7 @@ Everything nests under the parent meeting ID. Each meeting's export is self-cont
 ```
 {prefix}/{parentMeetingId}/
     artifacts-metadata.json            # Phase 1 Postgres dump
-    access-manifest.json               # user-to-breakout mapping
+    access-manifest.json               # v2: users, breakouts, expected_artifacts
     recording-artifacts.fail           # present only on partial/full failure
     annotated-{presentationName}.pdf   # annotated slides
     shared-notes/
@@ -230,9 +230,18 @@ The JWT payload contains:
   "meeting_id": "abc123-...",
   "artifacts": [
     {"meeting_id": "...", "file": "/local/path", "remote_file": "s3://..."}
+  ],
+  "expected_artifacts": ["annotated-deck.pdf", "shared-notes/notes.pdf"],
+  "breakouts": [
+    {"meeting_id": "br-...", "expected_artifacts": ["annotated-deck.pdf"]}
   ]
 }
 ```
+
+`expected_artifacts` (paths relative to each meeting's S3 prefix) lets the
+consumer reconcile what was actually uploaded against what Phase 2 intended
+to upload — useful for detecting partial failures. The list mirrors what
+`access-manifest.json` carries.
 
 Signed with `securitySalt` from `/etc/bigbluebutton/bbb-web.properties`.
 

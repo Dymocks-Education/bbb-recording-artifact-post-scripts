@@ -216,6 +216,11 @@ class RecordingArtifactsExporter
     FileUtils.mkdir_p(@stage_root)
     FileUtils.mkdir_p(@published_status_dir)
 
+    # expected_artifacts populated during export, read by build_access_manifest
+    # and send_callback. Keys for breakouts are breakout meetingIds.
+    @parent_expected_artifacts = []
+    @breakout_expected_artifacts = {}
+
     @logger.level = mode_defaults["log_level"]
   end
 
@@ -327,9 +332,10 @@ class RecordingArtifactsExporter
 
     export_shared_notes(raw_dir, mid, exports, errors) if @export_notes
 
-    # 3. Build access manifest
+    # 3. Build access manifest (raw_dir needed so manifest can list the notes
+    # files Phase 2 actually has on disk — not just what config requests).
     begin
-      result = build_access_manifest(dump)
+      result = build_access_manifest(dump, raw_dir)
       exports << result if result
     rescue => e
       @logger.error("Access manifest failed for #{mid}: #{e.message}")
@@ -424,6 +430,9 @@ class RecordingArtifactsExporter
           result = store_pdf_artifact(pdf_path, br_s3_subpath, br_mid)
           exports << result if result
         end
+        # Captureslide path uploads each PDF under its own basename
+        # (store_pdf_artifact falls back to File.basename(source) when no pres_name).
+        @breakout_expected_artifacts[br_mid] = captureslide_pdfs.map { |p| File.basename(p) }
         next
       end
 
@@ -437,6 +446,7 @@ class RecordingArtifactsExporter
 
       @logger.info("No pre-generated PDFs for breakout #{br_mid}, generating via Redis from Phase 1 dump")
       process_meeting(br_raw_dir, br_dump, br_s3_subpath, exports, errors)
+      @breakout_expected_artifacts[br_mid] = expected_annotated_pdfs(br_dump)
     end
   end
 
@@ -545,24 +555,34 @@ class RecordingArtifactsExporter
   # Access manifest
   # =========================================================================
 
-  def build_access_manifest(dump)
+  # v2 access manifest. Changes from v1:
+  #   - version: 2
+  #   - users[].extId → users[].ext_user_id (drop legacy field name)
+  #   - users dropped: userId (internal), keep only ext_user_id/name/moderator
+  #   - expected_artifacts at parent and per-breakout level for reconciliation
+  # Meeting-level "extId" (the meeting's external id) is kept unchanged.
+  def build_access_manifest(dump, raw_dir)
     meeting_ctx = dump["meeting"]
     mid = meeting_ctx["meetingId"]
-    users = dump["users"] || []
     breakouts = dump["breakouts"] || []
     breakout_users = dump["breakoutUsers"] || {}
 
+    @parent_expected_artifacts = expected_annotated_pdfs(dump) + expected_parent_notes(raw_dir)
+
     manifest = {
-      "version" => 1,
+      "version" => 2,
       "meetingId" => mid,
       "extId" => meeting_ctx["extId"],
-      "users" => users,
+      "expected_artifacts" => @parent_expected_artifacts,
+      "users" => (dump["users"] || []).map { |u| normalize_user(u) },
       "breakouts" => breakouts.map do |br|
+        br_mid = br["meetingId"]
         {
-          "meetingId" => br["meetingId"],
+          "meetingId" => br_mid,
           "sequence" => br["sequence"],
           "name" => br["name"],
-          "users" => breakout_users[br["meetingId"]] || [],
+          "expected_artifacts" => @breakout_expected_artifacts[br_mid] || [],
+          "users" => (breakout_users[br_mid] || []).map { |u| normalize_user(u) },
         }
       end,
     }
@@ -577,6 +597,15 @@ class RecordingArtifactsExporter
     remote_file = upload_to_s3(manifest_path, "#{mid}/access-manifest.json")
 
     { "meeting_id" => mid, "file" => manifest_path, "remote_file" => remote_file }
+  end
+
+  # Phase 1 dump shape → v2 manifest shape.
+  def normalize_user(u)
+    {
+      "ext_user_id" => u["extId"],
+      "name" => u["name"],
+      "moderator" => u["isModerator"] == true,
+    }
   end
 
   # =========================================================================
@@ -874,6 +903,35 @@ class RecordingArtifactsExporter
     candidates.find { |path| File.file?(path) && File.size(path).positive? }
   end
 
+  # =========================================================================
+  # Expected artifacts (manifest v2)
+  # =========================================================================
+  # Derived in Phase 2 because only Phase 2 sees the runtime config that
+  # determines what will actually be uploaded (@notes_formats, @export_notes,
+  # @include_breakouts) AND the on-disk state (captureslide PDFs, notes files).
+
+  # Annotated PDFs Phase 2 will produce from a Phase 1 dump's annotation rows.
+  # Filename must match store_pdf_artifact's basename derivation when pres_name
+  # is set: sanitize_filename("annotated-{pres_name without extension}") + ".pdf".
+  def expected_annotated_pdfs(dump)
+    (dump["presentations"] || []).each_with_object([]) do |pres, acc|
+      pages = pres["pages"] || []
+      next unless pages.any? { |p| p["annotations"] && !p["annotations"].empty? }
+      pres_name = pres["name"] || pres["presentationId"]
+      base = File.basename(pres_name, File.extname(pres_name))
+      acc << "#{sanitize_filename("annotated-#{base}")}.pdf"
+    end
+  end
+
+  # Notes Phase 2 will upload for the parent. Skips formats whose source is
+  # missing or empty (matches export_shared_notes / find_notes_file behavior).
+  def expected_parent_notes(raw_dir)
+    return [] unless @export_notes
+    @notes_formats.each_with_object([]) do |fmt, acc|
+      acc << "shared-notes/notes.#{fmt}" if find_notes_file(raw_dir, fmt)
+    end
+  end
+
   # --- Retry helper ---
 
   def with_retries(label)
@@ -969,7 +1027,18 @@ class RecordingArtifactsExporter
       entry
     end
 
-    payload = { meeting_id: @meeting_id, artifacts: artifacts }
+    # Mirror the manifest's expected_artifacts so Django can reconcile uploads
+    # from the callback alone — no extra S3 read. Same data the manifest holds.
+    breakouts_expected = @breakout_expected_artifacts.map do |br_mid, expected|
+      { "meeting_id" => br_mid, "expected_artifacts" => expected }
+    end
+
+    payload = {
+      meeting_id: @meeting_id,
+      artifacts: artifacts,
+      expected_artifacts: @parent_expected_artifacts,
+      breakouts: breakouts_expected,
+    }
     payload_encoded = JWT.encode(payload, secret)
 
     if @dry_run

@@ -200,9 +200,12 @@ begin
   # extId is the external user ID passed by the integration (e.g., Greenlight,
   # Moodle). This is what downstream systems use to match BBB users to their
   # own user records. userId is BBB's internal ID (w_xxxxx format).
+  # isModerator is a generated column on "user" (bbb_schema.sql ~L381):
+  # GENERATED ALWAYS AS (CASE WHEN "role" = 'MODERATOR' THEN true ELSE false END).
   users = pg_json(conn, <<~SQL, [meeting_id]) || []
     SELECT COALESCE(json_agg(json_build_object(
-      'userId', u."userId", 'extId', u."extId", 'name', u."name"
+      'userId', u."userId", 'extId', u."extId", 'name', u."name",
+      'isModerator', u."isModerator"
     ) ORDER BY u."userId"), '[]'::json)::text
     FROM "user" u WHERE u."meetingId" = $1;
   SQL
@@ -223,7 +226,8 @@ begin
     br_mid = br["meetingId"]
     br_users = pg_json(conn, <<~SQL, [br_mid]) || []
       SELECT COALESCE(json_agg(json_build_object(
-        'userId', u."userId", 'extId', u."extId", 'name', u."name"
+        'userId', u."userId", 'extId', u."extId", 'name', u."name",
+        'isModerator', u."isModerator"
       ) ORDER BY u."userId"), '[]'::json)::text
       FROM "breakoutRoom_user" bru
       JOIN "user" u ON u."meetingId" = bru."meetingId" AND u."userId" = bru."userId"
