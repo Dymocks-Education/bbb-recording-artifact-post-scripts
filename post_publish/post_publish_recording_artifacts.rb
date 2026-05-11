@@ -355,7 +355,7 @@ class RecordingArtifactsExporter
 
     # Upload artifacts-metadata.json
     begin
-      result = store_json_artifact(raw_dir, "artifacts-metadata.json", s3_subpath)
+      result = store_json_artifact(raw_dir, "artifacts-metadata.json", s3_subpath, mid)
       exports << result if result
     rescue => e
       @logger.error("Artifacts metadata failed for #{mid}: #{e.message}")
@@ -383,7 +383,7 @@ class RecordingArtifactsExporter
 
       begin
         pdf_path = find_or_generate_pdf(mid, s3_subpath, pres, pres_location, pages)
-        result = store_pdf_artifact(pdf_path, s3_subpath, pres["name"])
+        result = store_pdf_artifact(pdf_path, s3_subpath, mid, pres["name"])
         exports << result if result
       rescue => e
         @logger.error("Annotated PDF failed for #{pres_id} in #{mid}: #{e.message}")
@@ -414,14 +414,14 @@ class RecordingArtifactsExporter
       unless captureslide_pdfs.empty?
         @logger.info("Found #{captureslide_pdfs.length} pre-generated PDF(s) for breakout #{br_mid}")
         begin
-          result = store_json_artifact(br_raw_dir, "artifacts-metadata.json", br_s3_subpath)
+          result = store_json_artifact(br_raw_dir, "artifacts-metadata.json", br_s3_subpath, br_mid)
           exports << result if result
         rescue => e
           @logger.warn("Breakout metadata upload failed for #{br_mid}: #{e.message}")
         end
         upload_all_sources(br_raw_dir, br_s3_subpath)
         captureslide_pdfs.each do |pdf_path|
-          result = store_pdf_artifact(pdf_path, br_s3_subpath)
+          result = store_pdf_artifact(pdf_path, br_s3_subpath, br_mid)
           exports << result if result
         end
         next
@@ -445,7 +445,7 @@ class RecordingArtifactsExporter
   # =========================================================================
 
   # Store a JSON file (dump or manifest) to output dir and S3.
-  def store_json_artifact(source_dir, filename, s3_subpath)
+  def store_json_artifact(source_dir, filename, s3_subpath, mid)
     src = File.join(source_dir, filename)
     unless File.exist?(src)
       @logger.warn("No #{filename} in #{source_dir}")
@@ -461,11 +461,11 @@ class RecordingArtifactsExporter
 
     remote_file = upload_to_s3(dest, "#{s3_subpath}/#{filename}")
 
-    { "meeting_id" => @meeting_id, "file" => dest, "remote_file" => remote_file }
+    { "meeting_id" => mid, "file" => dest, "remote_file" => remote_file }
   end
 
   # Store a PDF artifact to output dir and S3.
-  def store_pdf_artifact(source_path, s3_subpath, pres_name = nil)
+  def store_pdf_artifact(source_path, s3_subpath, mid, pres_name = nil)
     output_subdir = local_artifact_path(local_subpath_for_s3_subpath(s3_subpath))
     FileUtils.mkdir_p(output_subdir)
 
@@ -486,10 +486,10 @@ class RecordingArtifactsExporter
 
     remote_file = upload_to_s3(@dry_run ? source_path : output_file, "#{s3_subpath}/#{basename}")
 
-    { "meeting_id" => @meeting_id, "file" => output_file, "remote_file" => remote_file }
+    { "meeting_id" => mid, "file" => output_file, "remote_file" => remote_file }
   end
 
-  def store_notes_artifact(source_path, format, s3_subpath)
+  def store_notes_artifact(source_path, format, s3_subpath, mid)
     output_subdir = local_artifact_path(File.join(local_subpath_for_s3_subpath(s3_subpath), "shared-notes"))
     FileUtils.mkdir_p(output_subdir)
 
@@ -500,7 +500,7 @@ class RecordingArtifactsExporter
 
     remote_file = upload_to_s3(@dry_run ? source_path : output_file, "#{s3_subpath}/shared-notes/#{basename}")
 
-    { "meeting_id" => @meeting_id, "file" => output_file, "remote_file" => remote_file, "type" => "shared-notes", "format" => format }
+    { "meeting_id" => mid, "file" => output_file, "remote_file" => remote_file, "type" => "shared-notes", "format" => format }
   end
 
   # Upload source SVGs and original PDF to S3 for rebuild capability.
@@ -856,7 +856,7 @@ class RecordingArtifactsExporter
       end
 
       begin
-        result = store_notes_artifact(notes_file, format, s3_subpath)
+        result = store_notes_artifact(notes_file, format, s3_subpath, @meeting_id)
         exports << result if result
       rescue => e
         @logger.error("Shared notes export failed for #{@meeting_id} format=#{format}: #{e.message}")
