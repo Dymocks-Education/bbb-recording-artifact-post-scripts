@@ -467,6 +467,14 @@ class RecordingArtifactsExporter
       br_raw_dir = File.join(@recording_dir, "raw", br_mid)
       br_s3_subpath = "#{parent_mid}/breakouts/#{br_mid}"
 
+      # Initialize empty up-front so failure paths still leave the breakout
+      # visible in the callback payload (callback enumerates this hash's
+      # keys, unlike the access manifest which iterates dump["breakouts"]).
+      # Without this, a breakout that fails Phase 2 disappears from the
+      # callback while still being listed in the manifest — making manifest
+      # vs callback reconciliation impossible for downstream consumers.
+      @breakout_expected_artifacts[br_mid] = []
+
       unless File.directory?(br_raw_dir)
         @logger.warn("Breakout raw dir missing for #{br_mid}, skipping")
         errors << { "meeting_id" => br_mid, "scope" => "breakout:#{br_mid}", "type" => "breakout-export", "error" => "raw dir missing" }
