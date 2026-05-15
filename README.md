@@ -151,7 +151,7 @@ Everything nests under the parent meeting ID. Each meeting's export is self-cont
 ```
 {prefix}/{parentMeetingId}/
     artifacts-metadata.json            # Phase 1 Postgres dump
-    access-manifest.json               # v2: users, breakouts, expected_artifacts
+    access-manifest.json               # v3: users, breakouts, expected_artifacts (all snake_case)
     recording-artifacts.fail           # present only on partial/full failure
     annotated-{presentationName}.pdf   # annotated slides
     shared-notes/
@@ -166,6 +166,9 @@ Everything nests under the parent meeting ID. Each meeting's export is self-cont
         {breakoutMeetingId}/
             artifacts-metadata.json    # breakout's own dump
             annotated-{name}.pdf
+            shared-notes/              # breakouts have their own shared notes
+                notes.pdf
+                notes.html
             sources/
                 {presId}/
                     svgs/slide1.svg ...
@@ -191,14 +194,23 @@ notes_formats:
 
 `txt`, `doc`, and `odt` may also be available if the BBB deployment archives them.
 
-Enable notes export with:
+Enable notes export server-wide:
 
 ```bash
 BBB_RECORDING_ARTIFACTS_EXPORT_NOTES=true
 BBB_RECORDING_ARTIFACTS_NOTES_FORMATS=pdf,html,etherpad
 ```
 
+Or per-meeting on the BBB `create` API call:
+
+```
+meta_artifactExportNotes=true
+meta_artifactExportNotesFormats=pdf,html,etherpad
+```
+
 The exporter copies only matching non-empty `notes.{format}` files that already exist in the raw archive or published notes output. Missing configured formats are logged and skipped; they do not mark the artifact export as failed.
+
+**Breakouts:** when notes export is enabled, each breakout room's own shared notes are also exported from the breakout's raw archive to `{prefix}/{parentMeetingId}/breakouts/{breakoutMeetingId}/shared-notes/`. The same `notes_formats` setting applies to both parent and breakout notes.
 
 ## Breakout room handling
 
@@ -209,6 +221,8 @@ Two strategies for breakout annotations:
 1. **Capture Slides enabled** (fast path): The breakout room renders its own annotated PDF before closing. These pre-generated PDFs are found in the raw archive and copied directly to S3.
 
 2. **Capture Slides disabled** (slow path): The breakout's own Phase 1 dump is loaded and PDFs are generated via bbb-export-annotations, identical to parent meeting processing.
+
+In both paths, the breakout's shared notes (if enabled via `BBB_RECORDING_ARTIFACTS_EXPORT_NOTES` or `meta_artifactExportNotes=true`) are exported from the breakout's own raw archive and uploaded under `{prefix}/{parentMeetingId}/breakouts/{breakoutMeetingId}/shared-notes/`.
 
 ## Rebuilding from S3
 
@@ -240,18 +254,37 @@ The JWT payload contains:
 {
   "meeting_id": "abc123-...",
   "artifacts": [
-    {"meeting_id": "...", "file": "/local/path", "remote_file": "s3://..."}
+    {"meeting_id": "abc123-...", "file": "/local/path/annotated-deck.pdf",
+     "remote_file": "s3://...", "type": "annotated-slides"},
+    {"meeting_id": "abc123-...", "file": "/local/path/notes.pdf",
+     "remote_file": "s3://...", "type": "shared-notes", "format": "pdf"},
+    {"meeting_id": "abc123-...", "file": "/local/path/access-manifest.json",
+     "remote_file": "s3://...", "type": "access-manifest"},
+    {"meeting_id": "br-...", "file": "/local/path/breakouts/br-.../annotated-deck.pdf",
+     "remote_file": "s3://...", "type": "annotated-slides"}
   ],
   "expected_artifacts": ["annotated-deck.pdf", "shared-notes/notes.pdf"],
   "breakouts": [
-    {"meeting_id": "br-...", "expected_artifacts": ["annotated-deck.pdf"]}
+    {"meeting_id": "br-...", "expected_artifacts": ["annotated-deck.pdf", "shared-notes/notes.pdf"]}
   ]
 }
 ```
 
+Each artifact carries its own `meeting_id` — for breakout artifacts this is
+the breakout's internal id, not the parent's. Consumers should route artifacts
+by `artifact.meeting_id`, not by the top-level `meeting_id`. The top-level
+`meeting_id` is always the parent (the callback only fires once per parent
+meeting, after all breakouts have been processed).
+
+Possible `type` values: `annotated-slides`, `shared-notes` (also carries
+`format`), `access-manifest`, `artifacts-metadata`, `raw-package`. The field
+may be absent on entries produced by older runs.
+
 `expected_artifacts` (paths relative to each meeting's S3 prefix) lets the
 consumer reconcile what was actually uploaded against what Phase 2 intended
-to upload — useful for detecting partial failures. The list mirrors what
+to upload — useful for detecting partial failures. Every breakout from the
+Phase 1 dump appears in `breakouts[]`, including breakouts whose Phase 2
+failed (their `expected_artifacts` will be empty). The list mirrors what
 `access-manifest.json` carries.
 
 Signed with `securitySalt` from `/etc/bigbluebutton/bbb-web.properties`.

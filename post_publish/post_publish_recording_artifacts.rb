@@ -384,7 +384,7 @@ class RecordingArtifactsExporter
       process_breakouts(dump, mid, exports, errors)
     end
 
-    export_shared_notes(raw_dir, mid, exports, errors) if @export_notes
+    export_shared_notes(raw_dir, mid, mid, "parent", exports, errors) if @export_notes
 
     # 3. Build access manifest (raw_dir needed so manifest can list the notes
     # files Phase 2 actually has on disk — not just what config requests).
@@ -464,6 +464,7 @@ class RecordingArtifactsExporter
   def process_breakouts(dump, parent_mid, exports, errors)
     (dump["breakouts"] || []).each do |breakout|
       br_mid = breakout["meetingId"]
+      br_scope = "breakout:#{br_mid}"
       br_raw_dir = File.join(@recording_dir, "raw", br_mid)
       br_s3_subpath = "#{parent_mid}/breakouts/#{br_mid}"
 
@@ -477,13 +478,15 @@ class RecordingArtifactsExporter
 
       unless File.directory?(br_raw_dir)
         @logger.warn("Breakout raw dir missing for #{br_mid}, skipping")
-        errors << { "meeting_id" => br_mid, "scope" => "breakout:#{br_mid}", "type" => "breakout-export", "error" => "raw dir missing" }
+        errors << { "meeting_id" => br_mid, "scope" => br_scope, "type" => "breakout-export", "error" => "raw dir missing" }
         next
       end
 
-      # Fast path: pre-generated PDFs from captureslides
+      expected = []
+
       captureslide_pdfs = find_captureslide_pdfs(br_raw_dir)
-      unless captureslide_pdfs.empty?
+      if !captureslide_pdfs.empty?
+        # Fast path: pre-generated PDFs from captureslides
         @logger.info("Found #{captureslide_pdfs.length} pre-generated PDF(s) for breakout #{br_mid}")
         begin
           result = store_json_artifact(br_raw_dir, "artifacts-metadata.json", br_s3_subpath, br_mid)
@@ -498,21 +501,32 @@ class RecordingArtifactsExporter
         end
         # Captureslide path uploads each PDF under its own basename
         # (store_pdf_artifact falls back to File.basename(source) when no pres_name).
-        @breakout_expected_artifacts[br_mid] = captureslide_pdfs.map { |p| File.basename(p) }
-        next
+        expected += captureslide_pdfs.map { |p| File.basename(p) }
+      else
+        # Slow path: generate from breakout's own Phase 1 dump
+        br_dump = load_phase1_dump(br_raw_dir)
+        unless br_dump
+          @logger.warn("No Phase 1 dump for breakout #{br_mid}, cannot generate annotations")
+          errors << { "meeting_id" => br_mid, "scope" => br_scope, "type" => "breakout-export", "error" => "no Phase 1 dump" }
+          # No annotations, but notes may still be exportable below — fall through.
+          br_dump = nil
+        end
+
+        if br_dump
+          @logger.info("No pre-generated PDFs for breakout #{br_mid}, generating via Redis from Phase 1 dump")
+          process_meeting(br_raw_dir, br_dump, br_s3_subpath, exports, errors)
+          expected += expected_annotated_pdfs(br_dump)
+        end
       end
 
-      # Slow path: generate from breakout's own Phase 1 dump
-      br_dump = load_phase1_dump(br_raw_dir)
-      unless br_dump
-        @logger.warn("No Phase 1 dump for breakout #{br_mid}, cannot generate annotations")
-        errors << { "meeting_id" => br_mid, "scope" => "breakout:#{br_mid}", "type" => "breakout-export", "error" => "no Phase 1 dump" }
-        next
+      # Shared notes apply to both fast and slow paths. The breakout's notes
+      # live in its own raw archive; find_notes_file looks there first.
+      if @export_notes
+        export_shared_notes(br_raw_dir, br_s3_subpath, br_mid, br_scope, exports, errors)
+        expected += expected_notes(br_raw_dir, br_mid)
       end
 
-      @logger.info("No pre-generated PDFs for breakout #{br_mid}, generating via Redis from Phase 1 dump")
-      process_meeting(br_raw_dir, br_dump, br_s3_subpath, exports, errors)
-      @breakout_expected_artifacts[br_mid] = expected_annotated_pdfs(br_dump)
+      @breakout_expected_artifacts[br_mid] = expected
     end
   end
 
@@ -520,8 +534,11 @@ class RecordingArtifactsExporter
   # Artifact storage
   # =========================================================================
 
-  # Store a JSON file (dump or manifest) to output dir and S3.
-  def store_json_artifact(source_dir, filename, s3_subpath, mid)
+  # Store a JSON file (currently the Phase 1 dump) to output dir and S3.
+  # type defaults to "artifacts-metadata" because that's the only filename
+  # routed through this method today. Callers that store a different JSON
+  # type should pass it explicitly.
+  def store_json_artifact(source_dir, filename, s3_subpath, mid, type: "artifacts-metadata")
     src = File.join(source_dir, filename)
     unless File.exist?(src)
       @logger.warn("No #{filename} in #{source_dir}")
@@ -537,7 +554,7 @@ class RecordingArtifactsExporter
 
     remote_file = upload_to_s3(dest, "#{s3_subpath}/#{filename}")
 
-    { "meeting_id" => mid, "file" => dest, "remote_file" => remote_file }
+    { "meeting_id" => mid, "file" => dest, "remote_file" => remote_file, "type" => type }
   end
 
   # Store a PDF artifact to output dir and S3.
@@ -562,7 +579,7 @@ class RecordingArtifactsExporter
 
     remote_file = upload_to_s3(@dry_run ? source_path : output_file, "#{s3_subpath}/#{basename}")
 
-    { "meeting_id" => mid, "file" => output_file, "remote_file" => remote_file }
+    { "meeting_id" => mid, "file" => output_file, "remote_file" => remote_file, "type" => "annotated-slides" }
   end
 
   def store_notes_artifact(source_path, format, s3_subpath, mid)
@@ -621,31 +638,38 @@ class RecordingArtifactsExporter
   # Access manifest
   # =========================================================================
 
-  # v2 access manifest. Changes from v1:
-  #   - version: 2
-  #   - users[].extId → users[].ext_user_id (drop legacy field name)
-  #   - users dropped: userId (internal), keep only ext_user_id/name/moderator
-  #   - expected_artifacts at parent and per-breakout level for reconciliation
-  # Meeting-level "extId" (the meeting's external id) is kept unchanged.
+  # v3 access manifest. Changes from v2:
+  #   - version: 3
+  #   - top-level meetingId → meeting_id, extId → ext_id
+  #   - breakouts[].meetingId → meeting_id
+  # Rationale: align manifest with callback (which is already all snake_case)
+  # and with downstream Python/Django conventions, so consumers don't have
+  # to keep track of which view uses camelCase and which uses snake_case.
+  # The Phase 1 dump keeps its existing camelCase shape — that's internal
+  # to BBB and not consumer-facing.
+  #
+  # v2 (legacy) shape:
+  #   { version: 2, meetingId, extId, expected_artifacts, users[ext_user_id|name|moderator],
+  #     breakouts[{meetingId, sequence, name, expected_artifacts, users[...]}] }
   def build_access_manifest(dump, raw_dir)
     meeting_ctx = dump["meeting"]
     mid = meeting_ctx["meetingId"]
     breakouts = dump["breakouts"] || []
     breakout_users = dump["breakoutUsers"] || {}
 
-    @parent_expected_artifacts = expected_annotated_pdfs(dump) + expected_parent_notes(raw_dir)
+    @parent_expected_artifacts = expected_annotated_pdfs(dump) + expected_notes(raw_dir, mid)
     @logger.info("Building access manifest for #{mid}: #{(dump['users'] || []).length} user(s), #{breakouts.length} breakout(s), expected_artifacts=#{@parent_expected_artifacts}")
 
     manifest = {
-      "version" => 2,
-      "meetingId" => mid,
-      "extId" => meeting_ctx["extId"],
+      "version" => 3,
+      "meeting_id" => mid,
+      "ext_id" => meeting_ctx["extId"],
       "expected_artifacts" => @parent_expected_artifacts,
       "users" => (dump["users"] || []).map { |u| normalize_user(u) },
       "breakouts" => breakouts.map do |br|
         br_mid = br["meetingId"]
         {
-          "meetingId" => br_mid,
+          "meeting_id" => br_mid,
           "sequence" => br["sequence"],
           "name" => br["name"],
           "expected_artifacts" => @breakout_expected_artifacts[br_mid] || [],
@@ -663,10 +687,10 @@ class RecordingArtifactsExporter
 
     remote_file = upload_to_s3(manifest_path, "#{mid}/access-manifest.json")
 
-    { "meeting_id" => mid, "file" => manifest_path, "remote_file" => remote_file }
+    { "meeting_id" => mid, "file" => manifest_path, "remote_file" => remote_file, "type" => "access-manifest" }
   end
 
-  # Phase 1 dump shape → v2 manifest shape.
+  # Phase 1 dump shape (camelCase) → v3 manifest user shape (snake_case).
   def normalize_user(u)
     {
       "ext_user_id" => u["extId"],
@@ -754,7 +778,7 @@ class RecordingArtifactsExporter
 
     if files_copied > 0
       remote_files = upload_directory_to_s3(package_dir, "#{mid}/raw-package")
-      exports << { "meeting_id" => mid, "file" => package_dir, "remote_files" => remote_files }
+      exports << { "meeting_id" => mid, "file" => package_dir, "remote_files" => remote_files, "type" => "raw-package" }
       @logger.info("Packaged #{files_copied} raw file(s) for external processing: #{package_dir}")
       @logger.info("Uploaded #{remote_files.length} file(s) to S3") if remote_files.any?
     else
@@ -947,36 +971,38 @@ class RecordingArtifactsExporter
     nil
   end
 
-  def export_shared_notes(raw_dir, s3_subpath, exports, errors)
+  # mid + scope let us reuse this for both the parent meeting and breakouts.
+  # scope is "parent" or "breakout:{br_mid}", controlling the error tag only.
+  def export_shared_notes(raw_dir, s3_subpath, mid, scope, exports, errors)
     @notes_formats.each do |format|
-      notes_file = find_notes_file(raw_dir, format)
+      notes_file = find_notes_file(raw_dir, format, mid)
       unless notes_file
-        @logger.info("No non-empty shared notes file notes.#{format} for #{@meeting_id}, skipping")
+        @logger.info("No non-empty shared notes file notes.#{format} for #{mid}, skipping")
         next
       end
 
       begin
-        result = store_notes_artifact(notes_file, format, s3_subpath, @meeting_id)
+        result = store_notes_artifact(notes_file, format, s3_subpath, mid)
         exports << result if result
       rescue => e
-        @logger.error("Shared notes export failed for #{@meeting_id} format=#{format}: #{e.class}: #{e.message}")
+        @logger.error("Shared notes export failed for #{mid} format=#{format}: #{e.class}: #{e.message}")
         @logger.error(e.backtrace.first(3).join("\n")) if e.backtrace
-        errors << { "meeting_id" => @meeting_id, "scope" => "parent", "type" => "shared-notes", "format" => format, "error" => "#{e.class}: #{e.message}" }
+        errors << { "meeting_id" => mid, "scope" => scope, "type" => "shared-notes", "format" => format, "error" => "#{e.class}: #{e.message}" }
       end
     end
   end
 
-  def find_notes_file(raw_dir, format)
+  def find_notes_file(raw_dir, format, mid)
     candidates = [
       File.join(raw_dir, "notes", "notes.#{format}"),
-      File.join(@published_dir, "notes", @meeting_id, "notes.#{format}"),
-      File.join(@published_dir, "presentation", @meeting_id, "notes.#{format}"),
+      File.join(@published_dir, "notes", mid, "notes.#{format}"),
+      File.join(@published_dir, "presentation", mid, "notes.#{format}"),
     ]
     candidates.find { |path| File.file?(path) && File.size(path).positive? }
   end
 
   # =========================================================================
-  # Expected artifacts (manifest v2)
+  # Expected artifacts (manifest v3)
   # =========================================================================
   # Derived in Phase 2 because only Phase 2 sees the runtime config that
   # determines what will actually be uploaded (@notes_formats, @export_notes,
@@ -995,12 +1021,13 @@ class RecordingArtifactsExporter
     end
   end
 
-  # Notes Phase 2 will upload for the parent. Skips formats whose source is
-  # missing or empty (matches export_shared_notes / find_notes_file behavior).
-  def expected_parent_notes(raw_dir)
+  # Notes Phase 2 will upload for a meeting (parent or breakout). Skips formats
+  # whose source is missing or empty (matches export_shared_notes /
+  # find_notes_file behavior). Paths are relative to the meeting's S3 prefix.
+  def expected_notes(raw_dir, mid)
     return [] unless @export_notes
     @notes_formats.each_with_object([]) do |fmt, acc|
-      acc << "shared-notes/notes.#{fmt}" if find_notes_file(raw_dir, fmt)
+      acc << "shared-notes/notes.#{fmt}" if find_notes_file(raw_dir, fmt, mid)
     end
   end
 
@@ -1103,6 +1130,8 @@ class RecordingArtifactsExporter
       entry = { "meeting_id" => e["meeting_id"], "file" => e["file"] }
       entry["remote_file"] = e["remote_file"] if e["remote_file"]
       entry["remote_files"] = e["remote_files"] if e["remote_files"]
+      entry["type"] = e["type"] if e["type"]
+      entry["format"] = e["format"] if e["format"]
       entry
     end
 
