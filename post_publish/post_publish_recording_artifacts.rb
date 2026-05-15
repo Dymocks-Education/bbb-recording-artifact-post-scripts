@@ -82,8 +82,11 @@ begin
   FileUtils.mkdir_p(log_dir)
   logger = Logger.new(File.join(log_dir, "recording-artifacts-#{meeting_id}.log"), "daily")
 rescue => e
+  # Per-meeting log unavailable — fall back to shared log AND emit a stderr
+  # breadcrumb so the failure is visible even if the fallback log is broken too.
+  $stderr.puts("[post_publish_recording_artifacts] Could not create per-meeting log for #{meeting_id}: #{e.class}: #{e.message}")
   logger = Logger.new(File.join(log_dir, "post_publish.log"), "weekly")
-  logger.warn("Could not create per-meeting log for #{meeting_id}: #{e.message}")
+  logger.warn("Could not create per-meeting log for #{meeting_id}: #{e.class}: #{e.message}")
 end
 logger.level = Logger::INFO
 BigBlueButton.logger = logger
@@ -94,7 +97,11 @@ BigBlueButton.logger = logger
 
 def load_env_config
   config = {}
-  if File.exist?(CONFIG_FILE)
+  unless File.exist?(CONFIG_FILE)
+    BigBlueButton.logger.warn("Config file #{CONFIG_FILE} not found; using defaults and meta_ overrides only")
+    return config
+  end
+  begin
     File.readlines(CONFIG_FILE).each do |line|
       line = line.strip
       next if line.empty? || line.start_with?("#")
@@ -105,14 +112,29 @@ def load_env_config
       value = value[1..-2] if value.length >= 2 && value[0] == value[-1] && %w[" '].include?(value[0])
       config[key.strip] = value
     end
+  rescue => e
+    BigBlueButton.logger.error("Failed to read #{CONFIG_FILE}: #{e.class}: #{e.message}")
+    raise
   end
+  BigBlueButton.logger.debug("Loaded #{config.size} key(s) from #{CONFIG_FILE}: #{config.keys.sort.join(", ")}")
   config
 end
 
 def get_metadata(key, meeting_metadata)
-  meeting_metadata.key?(key) ? meeting_metadata[key].value : nil
+  return nil if meeting_metadata.nil?
+  return meeting_metadata[key].value if meeting_metadata.key?(key)
+  # BBB lowercases user-supplied meta_ keys when serializing to events.xml,
+  # so the camelCase keys we look up won't exact-match. Fall back to a
+  # case-insensitive scan.
+  target = key.downcase
+  hit = meeting_metadata.find { |k, _| k.to_s.downcase == target }
+  hit ? hit[1].value : nil
 end
 
+# Maps user-facing camelCase meta_ keys (as documented in README and used on the
+# BBB API create call) to internal config keys. The camelCase is for humans; BBB
+# downcases meta_ keys when serializing to events.xml, so get_metadata does a
+# case-insensitive lookup against this map's keys.
 METADATA_TO_CONFIG = {
   "artifactExportMode"              => "BBB_RECORDING_ARTIFACTS_MODE",
   "artifactExportS3Bucket"          => "BBB_RECORDING_ARTIFACTS_S3_BUCKET",
@@ -126,6 +148,7 @@ METADATA_TO_CONFIG = {
   "artifactExportNotes"             => "BBB_RECORDING_ARTIFACTS_EXPORT_NOTES",
   "artifactExportNotesFormats"      => "BBB_RECORDING_ARTIFACTS_NOTES_FORMATS",
   "artifactExportNotesFormat"       => "BBB_RECORDING_ARTIFACTS_NOTES_FORMAT",
+  "artifactExportLocalFormat"       => "BBB_RECORDING_ARTIFACTS_LOCAL_FORMAT",
 }.freeze
 
 def load_config(meeting_metadata)
@@ -168,6 +191,17 @@ def parse_list(value, default)
   values.empty? ? default : values.uniq
 end
 
+# Resolve the published format directory name (e.g. "presentation", "video")
+# where local artifacts live under {published_dir}/{format}/{meetingId}/artifacts.
+# Restricts to a single safe path segment to keep the join inside @published_dir.
+def sanitize_format_dir(value, default)
+  return default if value.nil?
+  trimmed = value.strip
+  return default if trimmed.empty?
+  return default unless trimmed.match?(/\A[A-Za-z0-9._-]+\z/)
+  trimmed
+end
+
 # ---------------------------------------------------------------------------
 # Exporter
 # ---------------------------------------------------------------------------
@@ -201,7 +235,8 @@ class RecordingArtifactsExporter
     @artifact_root = BBB_PROPS["raw_presentation_src"]
     @recording_dir = BBB_PROPS["recording_dir"]
     @published_dir = BBB_PROPS["published_dir"]
-    @artifact_dir = File.join(@published_dir, "presentation", @meeting_id, "artifacts")
+    @local_format = sanitize_format_dir(config["BBB_RECORDING_ARTIFACTS_LOCAL_FORMAT"], "presentation")
+    @artifact_dir = File.join(@published_dir, @local_format, @meeting_id, "artifacts")
     @stage_root = File.join(
       config["BBB_RECORDING_ARTIFACTS_OUTPUT_DIR"] || mode_defaults["output_dir"],
       @meeting_id,
@@ -222,6 +257,19 @@ class RecordingArtifactsExporter
     @breakout_expected_artifacts = {}
 
     @logger.level = mode_defaults["log_level"]
+
+    # One-line summary of what is and isn't configured. Surfaces "callback URL
+    # not set" / "S3 not configured" upfront instead of leaving the operator
+    # to discover a silent skip later.
+    @logger.info(
+      "Config summary for [#{@meeting_id}]: " \
+      "mode=#{@mode} format=#{@format.inspect} local_format=#{@local_format} " \
+      "artifact_dir=#{@artifact_dir} " \
+      "s3=#{s3_configured? ? "#{@s3_bucket}/#{@s3_prefix} (region=#{@s3_region})" : "DISABLED"} " \
+      "callback_url=#{(@callback_url && !@callback_url.empty?) ? "set" : "DISABLED"} " \
+      "export_notes=#{@export_notes} notes_formats=#{@notes_formats.join(",")} " \
+      "include_breakouts=#{@include_breakouts} dry_run=#{@dry_run}"
+    )
   end
 
   def run
@@ -254,15 +302,17 @@ class RecordingArtifactsExporter
         FileUtils.touch(done_file)
         FileUtils.rm_f(fail_file)
         FileUtils.rm_f(local_artifact_path("recording-artifacts.fail"))
-        @logger.info("Artifact export complete for #{@meeting_id}: #{exports.length} artifact(s) (mode=#{@mode})")
+        @logger.info("Artifact export complete for #{@meeting_id}: #{exports.length} artifact(s) (mode=#{@mode}, local=#{@artifact_dir}, done=#{done_file})")
         send_callback(exports) if exports.any?
       elsif exports.any?
         write_fail_file(errors)
-        @logger.warn("Artifact export partial for #{@meeting_id}: #{exports.length} ok, #{errors.length} failed")
+        @logger.warn("Artifact export partial for #{@meeting_id}: #{exports.length} ok, #{errors.length} failed (mode=#{@mode}, fail_file=#{fail_file})")
+        errors.each_with_index { |err, i| @logger.warn("  partial-fail[#{i}] #{err.to_json}") }
         send_callback(exports)
       else
         write_fail_file(errors)
-        @logger.error("Artifact export failed for #{@meeting_id}: all artifacts failed")
+        @logger.error("Artifact export failed for #{@meeting_id}: all #{errors.length} artifact(s) failed (mode=#{@mode}, fail_file=#{fail_file})")
+        errors.each_with_index { |err, i| @logger.error("  fail[#{i}] #{err.to_json}") }
       end
 
       exports
@@ -274,7 +324,10 @@ class RecordingArtifactsExporter
   end
 
   def upload_directory_to_s3(local_dir, remote_prefix)
-    return [] unless s3_configured?
+    unless s3_configured?
+      @logger.debug("S3 not configured; not uploading directory #{local_dir}")
+      return []
+    end
 
     uploaded = []
     Dir.glob(File.join(local_dir, "**", "*")).each do |file_path|
@@ -304,13 +357,14 @@ class RecordingArtifactsExporter
 
     upload_directory_to_s3(log_dest, "#{@meeting_id}/logs") if File.directory?(log_dest)
   rescue => e
-    @logger.warn("Log upload failed for #{@meeting_id}: #{e.message}")
+    @logger.warn("Log upload failed for #{@meeting_id}: #{e.class}: #{e.message}")
+    @logger.warn(e.backtrace.first(3).join("\n")) if e.backtrace
   end
 
   def cleanup_stage
     FileUtils.rm_rf(@stage_root) if File.directory?(@stage_root)
   rescue => e
-    @logger.warn("Stage cleanup failed for #{@meeting_id}: #{e.message}")
+    @logger.warn("Stage cleanup failed for #{@meeting_id}: #{e.class}: #{e.message}")
   end
 
   private
@@ -338,8 +392,9 @@ class RecordingArtifactsExporter
       result = build_access_manifest(dump, raw_dir)
       exports << result if result
     rescue => e
-      @logger.error("Access manifest failed for #{mid}: #{e.message}")
-      errors << { "meeting_id" => mid, "scope" => "parent", "type" => "access-manifest", "error" => e.message }
+      @logger.error("Access manifest failed for #{mid}: #{e.class}: #{e.message}")
+      @logger.error(e.backtrace.first(5).join("\n")) if e.backtrace
+      errors << { "meeting_id" => mid, "scope" => "parent", "type" => "access-manifest", "error" => "#{e.class}: #{e.message}" }
     end
   end
 
@@ -355,6 +410,8 @@ class RecordingArtifactsExporter
     presentations = dump["presentations"] || []
     scope = s3_subpath == @meeting_id ? "parent" : "breakout:#{mid}"
 
+    @logger.info("Processing meeting #{mid} (scope=#{scope}): #{presentations.length} presentation(s) from raw_dir=#{raw_dir}")
+
     if presentations.empty?
       @logger.warn("No presentations in Phase 1 dump for #{mid}")
     end
@@ -364,8 +421,9 @@ class RecordingArtifactsExporter
       result = store_json_artifact(raw_dir, "artifacts-metadata.json", s3_subpath, mid)
       exports << result if result
     rescue => e
-      @logger.error("Artifacts metadata failed for #{mid}: #{e.message}")
-      errors << { "meeting_id" => mid, "scope" => scope, "type" => "artifacts-metadata", "error" => e.message }
+      @logger.error("Artifacts metadata failed for #{mid}: #{e.class}: #{e.message}")
+      @logger.error(e.backtrace.first(3).join("\n")) if e.backtrace
+      errors << { "meeting_id" => mid, "scope" => scope, "type" => "artifacts-metadata", "error" => "#{e.class}: #{e.message}" }
     end
 
     upload_all_sources(raw_dir, s3_subpath)
@@ -392,9 +450,9 @@ class RecordingArtifactsExporter
         result = store_pdf_artifact(pdf_path, s3_subpath, mid, pres["name"])
         exports << result if result
       rescue => e
-        @logger.error("Annotated PDF failed for #{pres_id} in #{mid}: #{e.message}")
-        @logger.error(e.backtrace.first(3).join("\n")) if e.backtrace
-        errors << { "meeting_id" => mid, "scope" => scope, "type" => "annotated-slides", "presId" => pres_id, "error" => e.message }
+        @logger.error("Annotated PDF failed for #{pres_id} in #{mid}: #{e.class}: #{e.message}")
+        @logger.error(e.backtrace.first(5).join("\n")) if e.backtrace
+        errors << { "meeting_id" => mid, "scope" => scope, "type" => "annotated-slides", "presId" => pres_id, "error" => "#{e.class}: #{e.message}" }
       end
     end
   end
@@ -423,7 +481,7 @@ class RecordingArtifactsExporter
           result = store_json_artifact(br_raw_dir, "artifacts-metadata.json", br_s3_subpath, br_mid)
           exports << result if result
         rescue => e
-          @logger.warn("Breakout metadata upload failed for #{br_mid}: #{e.message}")
+          @logger.warn("Breakout metadata upload failed for #{br_mid}: #{e.class}: #{e.message}")
         end
         upload_all_sources(br_raw_dir, br_s3_subpath)
         captureslide_pdfs.each do |pdf_path|
@@ -539,7 +597,7 @@ class RecordingArtifactsExporter
       upload_to_s3(pdf, "#{s3_subpath}/sources/#{pres_id}/#{File.basename(pdf)}")
     end
   rescue => e
-    @logger.warn("Source upload failed for #{pres_id} (non-fatal): #{e.message}")
+    @logger.warn("Source upload failed for #{pres_id} (non-fatal): #{e.class}: #{e.message}")
   end
 
   def upload_all_sources(raw_dir, s3_subpath)
@@ -568,6 +626,7 @@ class RecordingArtifactsExporter
     breakout_users = dump["breakoutUsers"] || {}
 
     @parent_expected_artifacts = expected_annotated_pdfs(dump) + expected_parent_notes(raw_dir)
+    @logger.info("Building access manifest for #{mid}: #{(dump['users'] || []).length} user(s), #{breakouts.length} breakout(s), expected_artifacts=#{@parent_expected_artifacts}")
 
     manifest = {
       "version" => 2,
@@ -816,7 +875,7 @@ class RecordingArtifactsExporter
       redis = redis_client
       redis.del(job_id)
     rescue => e
-      @logger.debug("Redis cleanup for #{job_id} failed (non-fatal): #{e.message}")
+      @logger.debug("Redis cleanup for #{job_id} failed (non-fatal): #{e.class}: #{e.message}")
     ensure
       redis.close rescue nil
     end
@@ -867,12 +926,16 @@ class RecordingArtifactsExporter
 
   def load_phase1_dump(raw_dir)
     path = File.join(raw_dir, "artifacts-metadata.json")
-    return nil unless File.exist?(path)
+    unless File.exist?(path)
+      @logger.info("No Phase 1 dump at #{path}")
+      return nil
+    end
     dump = JSON.parse(File.read(path))
-    @logger.debug("Loaded Phase 1 dump: version=#{dump['version']}, dumped=#{dump['dumpedAt']}")
+    @logger.info("Loaded Phase 1 dump: #{path} (version=#{dump['version']}, dumped=#{dump['dumpedAt']})")
     dump
   rescue => e
-    @logger.warn("Failed to load Phase 1 dump: #{e.message}")
+    @logger.warn("Failed to load Phase 1 dump from #{path}: #{e.class}: #{e.message}")
+    @logger.warn(e.backtrace.first(3).join("\n")) if e.backtrace
     nil
   end
 
@@ -888,8 +951,9 @@ class RecordingArtifactsExporter
         result = store_notes_artifact(notes_file, format, s3_subpath, @meeting_id)
         exports << result if result
       rescue => e
-        @logger.error("Shared notes export failed for #{@meeting_id} format=#{format}: #{e.message}")
-        errors << { "meeting_id" => @meeting_id, "scope" => "parent", "type" => "shared-notes", "format" => format, "error" => e.message }
+        @logger.error("Shared notes export failed for #{@meeting_id} format=#{format}: #{e.class}: #{e.message}")
+        @logger.error(e.backtrace.first(3).join("\n")) if e.backtrace
+        errors << { "meeting_id" => @meeting_id, "scope" => "parent", "type" => "shared-notes", "format" => format, "error" => "#{e.class}: #{e.message}" }
       end
     end
   end
@@ -942,10 +1006,11 @@ class RecordingArtifactsExporter
     rescue => e
       if attempts < @retry_max
         delay = @retry_delay * (2 ** (attempts - 1))
-        @logger.warn("#{label} failed (attempt #{attempts}/#{@retry_max}): #{e.message}, retrying in #{delay}s")
+        @logger.warn("#{label} failed (attempt #{attempts}/#{@retry_max}): #{e.class}: #{e.message}, retrying in #{delay}s")
         sleep(delay)
         retry
       end
+      @logger.error("#{label} failed after #{attempts} attempt(s); giving up: #{e.class}: #{e.message}")
       raise
     end
   end
@@ -972,7 +1037,10 @@ class RecordingArtifactsExporter
   end
 
   def upload_to_s3(local_path, remote_key)
-    return nil unless s3_configured?
+    unless s3_configured?
+      @logger.debug("S3 not configured; skipping upload of #{local_path}")
+      return nil
+    end
 
     full_key = s3_key(remote_key)
 
@@ -1005,18 +1073,21 @@ class RecordingArtifactsExporter
   # --- Callback ---
 
   def send_callback(exports)
-    return unless @callback_url && !@callback_url.empty?
+    if @callback_url.nil? || @callback_url.empty?
+      @logger.info("Callback skipped for #{@meeting_id}: no BBB_RECORDING_ARTIFACTS_CALLBACK_URL configured (env or meta_artifactExportCallbackUrl)")
+      return
+    end
 
     bbb_web_properties = "/etc/bigbluebutton/bbb-web.properties"
     unless File.exist?(bbb_web_properties)
-      @logger.warn("Cannot send callback: #{bbb_web_properties} not found")
+      @logger.warn("Cannot send callback for #{@meeting_id}: #{bbb_web_properties} not found")
       return
     end
 
     props = JavaProperties::Properties.new(bbb_web_properties)
     secret = props[:securitySalt]
     unless secret
-      @logger.warn("Cannot send callback: securitySalt not found in bbb-web.properties")
+      @logger.warn("Cannot send callback for #{@meeting_id}: securitySalt not found in #{bbb_web_properties}")
       return
     end
 
@@ -1046,6 +1117,9 @@ class RecordingArtifactsExporter
       return
     end
 
+    redacted_url = @callback_url.split("?", 2).first
+    @logger.info("Posting callback for #{@meeting_id}: #{artifacts.length} artifact(s), #{breakouts_expected.length} breakout(s) -> #{redacted_url}")
+
     with_retries("Callback POST") do
       uri = URI.parse(@callback_url)
       http = Net::HTTP.new(uri.host, uri.port)
@@ -1068,7 +1142,8 @@ class RecordingArtifactsExporter
       end
     end
   rescue => e
-    @logger.warn("Callback failed for #{@meeting_id}: #{e.message}")
+    @logger.warn("Callback failed for #{@meeting_id}: #{e.class}: #{e.message}")
+    @logger.warn(e.backtrace.first(5).join("\n")) if e.backtrace
   end
 
   # --- Status/lock files ---
@@ -1098,7 +1173,8 @@ class RecordingArtifactsExporter
     File.write(artifact_fail, content)
     upload_to_s3(artifact_fail, "#{@meeting_id}/recording-artifacts.fail")
   rescue => e
-    @logger.warn("Could not write or upload artifact fail file for #{@meeting_id}: #{e.message}")
+    @logger.warn("Could not write or upload artifact fail file for #{@meeting_id}: #{e.class}: #{e.message}")
+    @logger.warn(e.backtrace.first(3).join("\n")) if e.backtrace
   end
 
   def with_export_lock
@@ -1158,7 +1234,7 @@ begin
       exit 0
     end
   rescue => e
-    BigBlueButton.logger.warn("Could not parse events.xml for breakout check: #{e.message}, continuing")
+    BigBlueButton.logger.warn("Could not parse #{events_xml} for breakout check: #{e.class}: #{e.message}, continuing")
   end
 
   meeting_metadata = BigBlueButton::Events.get_meeting_metadata(events_xml)
@@ -1172,8 +1248,8 @@ begin
 
   BigBlueButton.logger.info("Phase 2 for [#{meeting_id}] completed: #{results.length} artifact(s) (mode=#{mode})")
 rescue => e
-  BigBlueButton.logger.warn("Phase 2 for [#{meeting_id}] failed: #{e.message}")
-  BigBlueButton.logger.warn(e.backtrace.first(5).join("\n")) if e.backtrace
+  BigBlueButton.logger.error("Phase 2 for [#{meeting_id}] failed: #{e.class}: #{e.message}")
+  BigBlueButton.logger.error(e.backtrace.first(10).join("\n")) if e.backtrace
 end
 
 BigBlueButton.logger.info("Phase 2 recording artifacts for [#{meeting_id}] ends")
@@ -1182,7 +1258,9 @@ BigBlueButton.logger.info("Phase 2 recording artifacts for [#{meeting_id}] ends"
 begin
   exporter.copy_and_upload_logs(log_dir, logger) if exporter
 rescue => e
-  $stderr.puts("Log copy failed for #{meeting_id}: #{e.message}")
+  msg = "Log copy failed for #{meeting_id}: #{e.class}: #{e.message}"
+  BigBlueButton.logger.warn(msg) rescue nil
+  $stderr.puts(msg)
 ensure
   exporter.cleanup_stage if exporter
 end

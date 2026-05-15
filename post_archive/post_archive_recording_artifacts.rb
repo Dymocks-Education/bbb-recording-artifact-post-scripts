@@ -117,15 +117,21 @@ end
 # user=bbb_core, password=bbb_core — but we read them dynamically in case
 # the deployment overrides them.
 def detect_postgres_params
-  return nil unless File.exist?(BBB_APPS_AKKA_CONFIG)
+  unless File.exist?(BBB_APPS_AKKA_CONFIG)
+    BigBlueButton.logger.warn("Postgres config not found at #{BBB_APPS_AKKA_CONFIG}")
+    return nil
+  end
   props = parse_hocon_properties(File.read(BBB_APPS_AKKA_CONFIG), "postgres")
-  host     = props["serverName"]
-  port     = props["portNumber"]
-  dbname   = props["databaseName"]
-  user     = props["user"]
-  password = props["password"]
-  return nil unless [host, port, dbname, user, password].all? { |v| v && !v.empty? }
-  { host: host, port: port.to_i, dbname: dbname, user: user, password: password }
+  required = { "serverName" => props["serverName"], "portNumber" => props["portNumber"],
+               "databaseName" => props["databaseName"], "user" => props["user"],
+               "password" => props["password"] }
+  missing = required.select { |_, v| v.nil? || v.empty? }.keys
+  unless missing.empty?
+    BigBlueButton.logger.warn("Postgres config in #{BBB_APPS_AKKA_CONFIG} is missing/empty: #{missing.join(', ')}")
+    return nil
+  end
+  { host: required["serverName"], port: required["portNumber"].to_i,
+    dbname: required["databaseName"], user: required["user"], password: required["password"] }
 end
 
 # Every Postgres query in this script returns a single JSON value (either a
@@ -146,9 +152,11 @@ end
 
 begin
   pg_params = detect_postgres_params
-  raise "Cannot detect Postgres connection parameters" unless pg_params
+  raise "Cannot detect Postgres connection parameters from #{BBB_APPS_AKKA_CONFIG}" unless pg_params
 
+  BigBlueButton.logger.info("Connecting to Postgres #{pg_params[:user]}@#{pg_params[:host]}:#{pg_params[:port]}/#{pg_params[:dbname]}")
   conn = PG.connect(pg_params)
+  BigBlueButton.logger.debug("Postgres connection established for [#{meeting_id}]")
 
   # ---------------------------------------------------------------------------
   # Meeting context
@@ -358,17 +366,19 @@ begin
   end
 
 rescue => e
-  BigBlueButton.logger.warn("Phase 1 snapshot for [#{meeting_id}] failed: #{e.message}")
-  BigBlueButton.logger.warn(e.backtrace.first(5).join("\n")) if e.backtrace
+  BigBlueButton.logger.error("Phase 1 snapshot for [#{meeting_id}] failed: #{e.class}: #{e.message}")
+  BigBlueButton.logger.error(e.backtrace.first(10).join("\n")) if e.backtrace
   begin
     FileUtils.mkdir_p(raw_dir)
     File.write(fail_file, JSON.pretty_generate({
       "meeting_id" => meeting_id,
       "timestamp" => Time.now.iso8601,
+      "error_class" => e.class.to_s,
       "error" => e.message,
     }) + "\n")
+    BigBlueButton.logger.info("Wrote Phase 1 failure marker: #{fail_file}")
   rescue => marker_error
-    BigBlueButton.logger.warn("Could not write #{fail_file}: #{marker_error.message}")
+    BigBlueButton.logger.warn("Could not write #{fail_file}: #{marker_error.class}: #{marker_error.message}")
   end
 ensure
   conn&.close

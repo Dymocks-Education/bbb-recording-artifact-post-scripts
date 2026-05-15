@@ -18,10 +18,17 @@ Postgres (live, ephemeral)
 Final local artifacts are stored under:
 
 ```text
-/var/bigbluebutton/published/presentation/{meetingId}/artifacts/
+/var/bigbluebutton/published/{format}/{meetingId}/artifacts/
 ```
 
-This keeps local artifacts aligned with BBB's file-backed recording lifecycle. A Web API `deleteRecordings` soft-delete moves the published presentation recording, including `artifacts/`, into `/var/bigbluebutton/deleted/presentation/{meetingId}/`. S3 retention and deletion remain owned by the downstream consumer.
+`{format}` defaults to `presentation` and can be overridden with
+`BBB_RECORDING_ARTIFACTS_LOCAL_FORMAT` (server-wide) or `meta_artifactExportLocalFormat`
+(per-meeting). Deployments that disable the presentation publish format
+should set this to a format that is published (e.g. `video`) so the local
+artifact copy lives under a directory BBB's file-backed recording lifecycle
+will actually manage.
+
+This keeps local artifacts aligned with BBB's file-backed recording lifecycle. A Web API `deleteRecordings` soft-delete moves the published recording, including `artifacts/`, into `/var/bigbluebutton/deleted/{format}/{meetingId}/`. S3 retention and deletion remain owned by the downstream consumer.
 
 ## Installation
 
@@ -54,18 +61,21 @@ AWS_SECRET_ACCESS_KEY=...
 
 ### 3. Install dependencies
 
-These gems are **not** included in a stock BBB install. Install the system library and gems into the recording pipeline's vendor bundle:
+These gems are **not** included in a stock BBB install. Install the system libraries and gems into the recording pipeline's vendor bundle:
 
 ```bash
-# System library required to build the pg gem native extension
-sudo apt-get install -y libpq-dev
+# Ruby headers (required to build bigdecimal and other native extensions)
+# and libpq (required to build the pg gem native extension)
+sudo apt-get install -y ruby3.0-dev libpq-dev
 
 # Add the gems to the BBB recording bundle
 cd /usr/local/bigbluebutton/core
 
-sudo bundle add pg --version '~> 1.4.0'
-sudo bundle add aws-sdk-s3 --version '~> 1.218'
-sudo bundle install --path vendor/bundle
+bundle add pg --version '~> 1.4.0'
+bundle add aws-sdk-s3 --version '~> 1.218'
+
+bundle config set path 'vendor/bundle'
+bundle install
 ```
 
 **Note:** BBB 3.0 ships Ruby 3.0.2. The `pg` gem must be pinned to `~> 1.4.0` — versions 1.5+ require Ruby 3.1+ and will fail to install.
@@ -112,6 +122,7 @@ All settings can be overridden at three levels (each overrides the previous):
 | `AWS_ACCESS_KEY_ID` | `artifactExportAwsKeyId` | _(none)_ | AWS credentials |
 | `AWS_SECRET_ACCESS_KEY` | `artifactExportAwsSecret` | _(none)_ | AWS credentials |
 | `BBB_RECORDING_ARTIFACTS_OUTPUT_DIR` | `artifactExportOutputDir` | mode-dependent | Temporary staging dir |
+| `BBB_RECORDING_ARTIFACTS_LOCAL_FORMAT` | `artifactExportLocalFormat` | `presentation` | Format dir under `published_dir` where local artifacts are written |
 | `BBB_RECORDING_ARTIFACTS_INCLUDE_BREAKOUTS` | `artifactExportIncludeBreakouts` | `true` | Process breakout rooms |
 | `BBB_RECORDING_ARTIFACTS_CALLBACK_URL` | `artifactExportCallbackUrl` | _(none)_ | JWT-signed POST on completion |
 | `BBB_RECORDING_ARTIFACTS_EXPORT_NOTES` | `artifactExportNotes` | `false` | Export archived shared notes |

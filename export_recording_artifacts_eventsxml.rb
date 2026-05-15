@@ -77,12 +77,19 @@ else
   logger = Logger.new($stderr)
 end
 logger.level = opts[:verbose] ? Logger::DEBUG : Logger::INFO
+EventsXmlFallback.logger = logger
 
 # ---------------------------------------------------------------------------
 # Events.xml parser
 # ---------------------------------------------------------------------------
 
 module EventsXmlFallback
+  class << self
+    # Set once at startup so inner per-record rescues can warn instead of
+    # swallowing parse failures silently. Optional — falls back to no-op.
+    attr_accessor :logger
+  end
+
   def self.meeting_info(events)
     meeting_el = events.at_xpath("/recording/meeting")
     breakout_el = events.at_xpath("/recording/breakout")
@@ -142,7 +149,12 @@ module EventsXmlFallback
       raw = event.at_xpath("shapeData")&.content
       uid = event.at_xpath("userId")&.content
       next unless pid && pnum && sid && raw
-      data = JSON.parse(raw) rescue next
+      begin
+        data = JSON.parse(raw)
+      rescue => e
+        logger&.warn("Skipping malformed shapeData (pres=#{pid} page=#{pnum} shape=#{sid}): #{e.class}: #{e.message}")
+        next
+      end
       wb_id = event.at_xpath("whiteboardId")&.content || "#{pid}/#{pnum}"
       annotations[pid] ||= {}
       annotations[pid][pnum] ||= {}
@@ -170,9 +182,16 @@ module EventsXmlFallback
     Dir.glob(File.join(svgs_dir, "slide*.svg")).each do |svg|
       pnum = File.basename(svg, ".svg").sub("slide", "").to_i
       next if pnum < 1
-      header = File.read(svg, 1024) rescue next
+      begin
+        header = File.read(svg, 1024)
+      rescue => e
+        logger&.warn("Could not read SVG #{svg}: #{e.class}: #{e.message}")
+        next
+      end
       if (m = header.match(/viewBox="0\s+0\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)"/))
         pages[pnum] = { "width" => m[1].to_f, "height" => m[2].to_f }
+      else
+        logger&.warn("Could not parse viewBox from #{svg}; page dimensions will default to 1920x1080")
       end
     end
     pages
@@ -196,7 +215,13 @@ end
 
 logger.info("Processing events.xml from #{input_dir}")
 
-events = Nokogiri::XML(File.open(events_xml_path))
+begin
+  events = Nokogiri::XML(File.open(events_xml_path))
+rescue => e
+  logger.error("Failed to parse #{events_xml_path}: #{e.class}: #{e.message}")
+  exit 1
+end
+
 meeting_info = EventsXmlFallback.meeting_info(events)
 participants = EventsXmlFallback.participants(events)
 mid = meeting_info["meetingId"]
@@ -254,9 +279,15 @@ dump = {
 
 total_annotations = presentations.sum { |p| (p["pages"] || []).sum { |pg| (pg["annotations"] || []).length } }
 
-tmp = "#{output_file}.tmp"
-File.write(tmp, JSON.pretty_generate(dump) + "\n")
-File.rename(tmp, output_file)
+begin
+  tmp = "#{output_file}.tmp"
+  File.write(tmp, JSON.pretty_generate(dump) + "\n")
+  File.rename(tmp, output_file)
+rescue => e
+  logger.error("Failed to write #{output_file}: #{e.class}: #{e.message}")
+  logger.error(e.backtrace.first(5).join("\n")) if e.backtrace
+  exit 1
+end
 
 logger.info(
   "Events.xml fallback for [#{mid}]: " \
