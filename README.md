@@ -151,7 +151,7 @@ Everything nests under the parent meeting ID. Each meeting's export is self-cont
 ```
 {prefix}/{parentMeetingId}/
     artifacts-metadata.json            # Phase 1 Postgres dump
-    access-manifest.json               # v3: users, breakouts, expected_artifacts (all snake_case)
+    access-manifest.json               # v4: meeting{}, breakouts[], errors[] (snake_case throughout)
     recording-artifacts.fail           # present only on partial/full failure
     annotated-{presentationName}.pdf   # annotated slides
     shared-notes/
@@ -249,6 +249,11 @@ Content-Type: application/x-www-form-urlencoded
 signed_parameters={JWT_TOKEN}
 ```
 
+The callback fires on every path — success, partial failure, and full
+failure — so Django sees a definitive signal in all cases instead of
+waiting for an S3 sweep to time out. The same `errors[]` array that appears
+on the manifest is included in the callback envelope.
+
 The JWT payload contains:
 ```json
 {
@@ -266,6 +271,10 @@ The JWT payload contains:
   "expected_artifacts": ["annotated-deck.pdf", "shared-notes/notes.pdf"],
   "breakouts": [
     {"meeting_id": "br-...", "expected_artifacts": ["annotated-deck.pdf", "shared-notes/notes.pdf"]}
+  ],
+  "errors": [
+    {"meeting_id": "br-...", "scope": "breakout:br-...", "type": "breakout-export",
+     "error": "Timeout::Error: ..."}
   ]
 }
 ```
@@ -288,6 +297,58 @@ failed (their `expected_artifacts` will be empty). The list mirrors what
 `access-manifest.json` carries.
 
 Signed with `securitySalt` from `/etc/bigbluebutton/bbb-web.properties`.
+
+## Access manifest
+
+`access-manifest.json` is uploaded to `{prefix}/{parentMeetingId}/access-manifest.json` and mirrored under the local recording. It is the authoritative record of who and what was in the meeting and is the canonical reconciliation source for downstream consumers.
+
+```json
+{
+  "version": 4,
+  "meeting": {
+    "meeting_id":         "<parent internal id>",
+    "ext_id":             "<parent external id>",
+    "is_breakout":        false,
+    "sequence":           0,
+    "name":               "Parent meeting name",
+    "started_at":         "2026-05-18T13:04:11Z",
+    "ended_at":           "2026-05-18T14:02:55Z",
+    "expected_artifacts": ["annotated-deck.pdf", "shared-notes/notes.pdf"],
+    "users": [
+      {"ext_user_id": "...", "name": "...", "moderator": true}
+    ]
+  },
+  "breakouts": [
+    {
+      "meeting_id":         "<breakout internal id>",
+      "ext_id":             "<breakout external id>",
+      "is_breakout":        true,
+      "sequence":           1,
+      "name":               "Room 1",
+      "started_at":         "2026-05-18T13:18:42Z",
+      "ended_at":           "2026-05-18T13:48:10Z",
+      "expected_artifacts": ["annotated-deck.pdf"],
+      "users": [{"ext_user_id": "...", "name": "...", "moderator": false}]
+    }
+  ],
+  "errors": [
+    {
+      "meeting_id": "<parent or breakout internal>",
+      "scope":      "parent | breakout:<mid>",
+      "type":       "annotated-slides | breakout-export | access-manifest | export | ...",
+      "error":      "<class>: <message>"
+    }
+  ]
+}
+```
+
+### Notes
+
+- Parent and each breakout share the same key set so consumers can iterate them uniformly. Parent's `sequence` is always `0` (sentinel for "not a breakout").
+- `started_at` / `ended_at` come from Postgres `meeting.createdTime` and `meeting.endedAt`, formatted as ISO 8601 UTC. These are authoritative — downstream consumers should prefer them over row-creation timestamps on the Django side, which lag the real meeting boundaries.
+- Every declared breakout appears in `breakouts[]`, including breakouts that produced no recording. `expected_artifacts` is `[]` if Phase 2 failed for that breakout.
+- `errors[]` is always present (empty on full success). The same array is emitted in the callback envelope so the two surfaces stay consistent.
+- `users[].ext_user_id` is the external user ID the integration passed to BBB on join — the consumer's authoritative key for matching BBB users to its own records.
 
 ## Logs
 
