@@ -71,11 +71,11 @@ sudo apt-get install -y ruby3.0-dev libpq-dev
 # Add the gems to the BBB recording bundle
 cd /usr/local/bigbluebutton/core
 
-bundle add pg --version '~> 1.4.0'
-bundle add aws-sdk-s3 --version '~> 1.218'
+sudo bundle add pg --version '~> 1.4.0'
+sudo bundle add aws-sdk-s3 --version '~> 1.218'
 
 bundle config set path 'vendor/bundle'
-bundle install
+sudo bundle install
 ```
 
 **Note:** BBB 3.0 ships Ruby 3.0.2. The `pg` gem must be pinned to `~> 1.4.0` — versions 1.5+ require Ruby 3.1+ and will fail to install.
