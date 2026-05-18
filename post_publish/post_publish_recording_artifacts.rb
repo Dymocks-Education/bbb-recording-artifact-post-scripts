@@ -290,12 +290,35 @@ class RecordingArtifactsExporter
       exports = []
       errors = []
 
+      # Wrap export so a raise still lets us build a manifest with errors[]
+      # and fire the failure-path callback. Without this, Django would only
+      # see the failure via the S3 sweep timeout.
+      begin
+        if dump
+          @logger.info("Using Phase 1 Postgres dump for #{@meeting_id} (mode=#{@mode})")
+          export(raw_dir, dump, exports, errors)
+        else
+          @logger.info("No Phase 1 dump for #{@meeting_id}, packaging raw files for external processing (mode=#{@mode})")
+          package_raw_files(raw_dir, exports, errors)
+        end
+      rescue => e
+        @logger.error("Export raised for #{@meeting_id}: #{e.class}: #{e.message}")
+        @logger.error(e.backtrace.first(10).join("\n")) if e.backtrace
+        errors << { "meeting_id" => @meeting_id, "scope" => "parent", "type" => "export", "error" => "#{e.class}: #{e.message}" }
+      end
+
+      # Build manifest AFTER export so errors[] captures everything that
+      # happened during export. Only meaningful when we have a Phase 1 dump
+      # — the raw-package fallback has no dump to derive a v4 manifest from.
       if dump
-        @logger.info("Using Phase 1 Postgres dump for #{@meeting_id} (mode=#{@mode})")
-        export(raw_dir, dump, exports, errors)
-      else
-        @logger.info("No Phase 1 dump for #{@meeting_id}, packaging raw files for external processing (mode=#{@mode})")
-        package_raw_files(raw_dir, exports, errors)
+        begin
+          result = build_access_manifest(dump, raw_dir, errors)
+          exports << result if result
+        rescue => e
+          @logger.error("Access manifest failed for #{@meeting_id}: #{e.class}: #{e.message}")
+          @logger.error(e.backtrace.first(5).join("\n")) if e.backtrace
+          errors << { "meeting_id" => @meeting_id, "scope" => "parent", "type" => "access-manifest", "error" => "#{e.class}: #{e.message}" }
+        end
       end
 
       if errors.empty?
@@ -303,17 +326,19 @@ class RecordingArtifactsExporter
         FileUtils.rm_f(fail_file)
         FileUtils.rm_f(local_artifact_path("recording-artifacts.fail"))
         @logger.info("Artifact export complete for #{@meeting_id}: #{exports.length} artifact(s) (mode=#{@mode}, local=#{@artifact_dir}, done=#{done_file})")
-        send_callback(exports) if exports.any?
       elsif exports.any?
         write_fail_file(errors)
         @logger.warn("Artifact export partial for #{@meeting_id}: #{exports.length} ok, #{errors.length} failed (mode=#{@mode}, fail_file=#{fail_file})")
         errors.each_with_index { |err, i| @logger.warn("  partial-fail[#{i}] #{err.to_json}") }
-        send_callback(exports)
       else
         write_fail_file(errors)
         @logger.error("Artifact export failed for #{@meeting_id}: all #{errors.length} artifact(s) failed (mode=#{@mode}, fail_file=#{fail_file})")
         errors.each_with_index { |err, i| @logger.error("  fail[#{i}] #{err.to_json}") }
       end
+
+      # Callback fires on every path — success, partial, full failure.
+      # Django sees the same errors[] in the callback as in the manifest.
+      send_callback(exports, errors)
 
       exports
     end
@@ -386,16 +411,9 @@ class RecordingArtifactsExporter
 
     export_shared_notes(raw_dir, mid, mid, "parent", exports, errors) if @export_notes
 
-    # 3. Build access manifest (raw_dir needed so manifest can list the notes
-    # files Phase 2 actually has on disk — not just what config requests).
-    begin
-      result = build_access_manifest(dump, raw_dir)
-      exports << result if result
-    rescue => e
-      @logger.error("Access manifest failed for #{mid}: #{e.class}: #{e.message}")
-      @logger.error(e.backtrace.first(5).join("\n")) if e.backtrace
-      errors << { "meeting_id" => mid, "scope" => "parent", "type" => "access-manifest", "error" => "#{e.class}: #{e.message}" }
-    end
+    # Note: build_access_manifest is deliberately NOT called here. It runs
+    # after export() in run() so the manifest's errors[] reflects everything
+    # that failed during export, not just what failed before manifest-build.
   end
 
   # =========================================================================
@@ -638,44 +656,60 @@ class RecordingArtifactsExporter
   # Access manifest
   # =========================================================================
 
-  # v3 access manifest. Changes from v2:
-  #   - version: 3
-  #   - top-level meetingId → meeting_id, extId → ext_id
-  #   - breakouts[].meetingId → meeting_id
-  # Rationale: align manifest with callback (which is already all snake_case)
-  # and with downstream Python/Django conventions, so consumers don't have
-  # to keep track of which view uses camelCase and which uses snake_case.
-  # The Phase 1 dump keeps its existing camelCase shape — that's internal
-  # to BBB and not consumer-facing.
+  # v4 access manifest.
   #
-  # v2 (legacy) shape:
-  #   { version: 2, meetingId, extId, expected_artifacts, users[ext_user_id|name|moderator],
-  #     breakouts[{meetingId, sequence, name, expected_artifacts, users[...]}] }
-  def build_access_manifest(dump, raw_dir)
+  # Shape (snake_case throughout; Phase 1 dump stays camelCase as that's
+  # internal-to-BBB):
+  #   {
+  #     version: 4,
+  #     meeting: { meeting_id, ext_id, is_breakout, sequence, name,
+  #                started_at, ended_at, expected_artifacts, users[] },
+  #     breakouts: [{ meeting_id, ext_id, is_breakout, sequence, name,
+  #                   started_at, ended_at, expected_artifacts, users[] }],
+  #     errors: [{ meeting_id, scope, type, error }]
+  #   }
+  #
+  # Parent and breakouts are structurally symmetric — same key set on each.
+  # Parent's sequence is always 0 (sentinel for "not a breakout") so consumers
+  # can sort uniformly. Timestamps come from the Phase 1 dump, which reads
+  # meeting.createdTime / meeting.endedAt from Postgres.
+  def build_access_manifest(dump, raw_dir, errors)
     meeting_ctx = dump["meeting"]
     mid = meeting_ctx["meetingId"]
     breakouts = dump["breakouts"] || []
     breakout_users = dump["breakoutUsers"] || {}
 
     @parent_expected_artifacts = expected_annotated_pdfs(dump) + expected_notes(raw_dir, mid)
-    @logger.info("Building access manifest for #{mid}: #{(dump['users'] || []).length} user(s), #{breakouts.length} breakout(s), expected_artifacts=#{@parent_expected_artifacts}")
+    @logger.info("Building access manifest for #{mid}: #{(dump['users'] || []).length} user(s), #{breakouts.length} breakout(s), expected_artifacts=#{@parent_expected_artifacts}, errors=#{errors.length}")
 
     manifest = {
-      "version" => 3,
-      "meeting_id" => mid,
-      "ext_id" => meeting_ctx["extId"],
-      "expected_artifacts" => @parent_expected_artifacts,
-      "users" => (dump["users"] || []).map { |u| normalize_user(u) },
+      "version" => 4,
+      "meeting" => {
+        "meeting_id" => mid,
+        "ext_id" => meeting_ctx["extId"],
+        "is_breakout" => meeting_ctx["isBreakout"] == true,
+        "sequence" => 0,
+        "name" => meeting_ctx["name"],
+        "started_at" => meeting_ctx["startedAt"],
+        "ended_at" => meeting_ctx["endedAt"],
+        "expected_artifacts" => @parent_expected_artifacts,
+        "users" => (dump["users"] || []).map { |u| normalize_user(u) },
+      },
       "breakouts" => breakouts.map do |br|
         br_mid = br["meetingId"]
         {
           "meeting_id" => br_mid,
+          "ext_id" => br["extId"],
+          "is_breakout" => true,
           "sequence" => br["sequence"],
           "name" => br["name"],
+          "started_at" => br["startedAt"],
+          "ended_at" => br["endedAt"],
           "expected_artifacts" => @breakout_expected_artifacts[br_mid] || [],
           "users" => (breakout_users[br_mid] || []).map { |u| normalize_user(u) },
         }
       end,
+      "errors" => errors,
     }
 
     output_subdir = local_artifact_path(local_subpath_for_s3_subpath(mid))
@@ -690,7 +724,7 @@ class RecordingArtifactsExporter
     { "meeting_id" => mid, "file" => manifest_path, "remote_file" => remote_file, "type" => "access-manifest" }
   end
 
-  # Phase 1 dump shape (camelCase) → v3 manifest user shape (snake_case).
+  # Phase 1 dump shape (camelCase) → v4 manifest user shape (snake_case).
   def normalize_user(u)
     {
       "ext_user_id" => u["extId"],
@@ -1107,7 +1141,7 @@ class RecordingArtifactsExporter
 
   # --- Callback ---
 
-  def send_callback(exports)
+  def send_callback(exports, errors)
     if @callback_url.nil? || @callback_url.empty?
       @logger.info("Callback skipped for #{@meeting_id}: no BBB_RECORDING_ARTIFACTS_CALLBACK_URL configured (env or meta_artifactExportCallbackUrl)")
       return
@@ -1146,6 +1180,7 @@ class RecordingArtifactsExporter
       artifacts: artifacts,
       expected_artifacts: @parent_expected_artifacts,
       breakouts: breakouts_expected,
+      errors: errors,
     }
     payload_encoded = JWT.encode(payload, secret)
 
@@ -1155,7 +1190,7 @@ class RecordingArtifactsExporter
     end
 
     redacted_url = @callback_url.split("?", 2).first
-    @logger.info("Posting callback for #{@meeting_id}: #{artifacts.length} artifact(s), #{breakouts_expected.length} breakout(s) -> #{redacted_url}")
+    @logger.info("Posting callback for #{@meeting_id}: #{artifacts.length} artifact(s), #{breakouts_expected.length} breakout(s), #{errors.length} error(s) -> #{redacted_url}")
 
     with_retries("Callback POST") do
       uri = URI.parse(@callback_url)

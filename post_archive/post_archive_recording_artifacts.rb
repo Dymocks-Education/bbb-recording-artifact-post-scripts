@@ -150,6 +150,15 @@ def pg_json(conn, sql, params = [])
   JSON.parse(raw)
 end
 
+# SQL snippet that formats a timestamptz column as ISO 8601 UTC (Z-suffix).
+# Postgres' default JSON serialization of timestamptz uses the session
+# timezone, which is not what we want — downstream consumers expect UTC.
+# Used for both startedAt (from createdTime via to_timestamp) and endedAt
+# (already timestamptz).
+def iso_utc(expr)
+  %(to_char((#{expr}) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))
+end
+
 begin
   pg_params = detect_postgres_params
   raise "Cannot detect Postgres connection parameters from #{BBB_APPS_AKKA_CONFIG}" unless pg_params
@@ -164,13 +173,21 @@ begin
   # The LEFT JOIN on meeting_breakoutRoomProps distinguishes breakout rooms
   # from parent meetings. parentMeetingId is set for breakouts but has the
   # sentinel value 'bbb-none' for parent meetings — hence the explicit check.
+  #
+  # startedAt/endedAt are sourced from meeting.createdTime (bigint epoch ms,
+  # written by bbb-apps-akka on meeting creation) and meeting.endedAt
+  # (timestamptz, written when the meeting ends). Both formatted as ISO 8601
+  # UTC strings. endedAt may be null in pathological cases where post_archive
+  # runs before the end is recorded — downstream consumers should tolerate.
   meeting_ctx = pg_json(conn, <<~SQL, [meeting_id])
     SELECT row_to_json(t)::text FROM (
-      SELECT m."meetingId", m."extId",
+      SELECT m."meetingId", m."extId", m."name",
              mbp."parentMeetingId", mbp."sequence",
              CASE WHEN mbp."parentMeetingId" IS NOT NULL
                    AND mbp."parentMeetingId" <> 'bbb-none'
-                  THEN true ELSE false END AS "isBreakout"
+                  THEN true ELSE false END AS "isBreakout",
+             #{iso_utc("to_timestamp(m.\"createdTime\" / 1000.0)")} AS "startedAt",
+             #{iso_utc('m."endedAt"')} AS "endedAt"
       FROM "meeting" m
       LEFT JOIN "meeting_breakoutRoomProps" mbp USING ("meetingId")
       WHERE m."meetingId" = $1
@@ -183,21 +200,33 @@ begin
     exit 0
   end
 
+  BigBlueButton.logger.info("Meeting times for [#{meeting_id}]: #{meeting_ctx['startedAt']} -> #{meeting_ctx['endedAt']}")
+
   # ---------------------------------------------------------------------------
   # Breakout rooms (only for parent meetings)
   # ---------------------------------------------------------------------------
   # v_breakoutRoom_createdLatest is a view that returns the most recent
   # breakout room creation per sequence number. We only query this from the
   # parent meeting — breakout rooms don't have nested breakouts.
+  #
+  # JOIN "meeting" to pull the breakout's external id and timestamps in one
+  # query. INNER JOIN is correct: a breakout row in the view must have a
+  # matching meeting row (the view is built from breakoutRoom which has an
+  # FK to meeting). If a breakout was declared but never spun up
+  # (no meeting row), we won't see it here — that's the same gap v3 had.
   breakouts = []
   unless meeting_ctx["isBreakout"]
     breakouts = pg_json(conn, <<~SQL, [meeting_id]) || []
       SELECT COALESCE(json_agg(json_build_object(
         'meetingId', br."breakoutRoomMeetingId",
-        'sequence', br."sequence",
-        'name', br."name"
+        'extId',     m."extId",
+        'sequence',  br."sequence",
+        'name',      br."name",
+        'startedAt', #{iso_utc("to_timestamp(m.\"createdTime\" / 1000.0)")},
+        'endedAt',   #{iso_utc('m."endedAt"')}
       ) ORDER BY br."sequence"), '[]'::json)::text
       FROM "v_breakoutRoom_createdLatest" br
+      JOIN "meeting" m ON m."meetingId" = br."breakoutRoomMeetingId"
       WHERE br."meetingId" = $1;
     SQL
   end
