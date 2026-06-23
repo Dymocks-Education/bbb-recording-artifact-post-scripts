@@ -42,6 +42,8 @@ sudo cp post_publish/post_publish_recording_artifacts.rb \
   /usr/local/bigbluebutton/core/scripts/post_publish/
 ```
 
+Make sure the scripts have the proper permissions to read, write or execute.
+
 ### 2. Install config
 
 ```bash
